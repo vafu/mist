@@ -1,0 +1,20 @@
+[package]
+name = "mist-cli"
+description = "Native command-line host for Mist"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[[bin]]
+name = "mist"
+path = "src/main.rs"
+
+[dependencies]
+iroh.workspace = true
+mist-core = { path = "../../core" }
+qrcode.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

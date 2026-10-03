@@ -1,0 +1,31 @@
+[versions]
+kotlin = "2.4.10"
+android-gradle-plugin = "9.1.0"
+compose-multiplatform = "1.12.1"
+compose-material3 = "1.12.0-alpha03"
+activity-compose = "1.10.1"
+coroutines = "1.11.0"
+gobley = "0.3.7"
+atomicfu = "0.26.1"
+jna = "5.18.1"
+google-code-scanner = "16.1.0"
+
+[libraries]
+iroh-api = { module = "io.github.vafu:api", version = "0.1.0-SNAPSHOT" }
+iroh-runtime = { module = "io.github.vafu:iroh-runtime", version = "0.1.0-SNAPSHOT" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
+compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose-multiplatform" }
+compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose-material3" }
+compose-runtime = { module = "org.jetbrains.compose.runtime:runtime", version.ref = "compose-multiplatform" }
+compose-ui = { module = "org.jetbrains.compose.ui:ui", version.ref = "compose-multiplatform" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }
+google-code-scanner = { module = "com.google.android.gms:play-services-code-scanner", version.ref = "google-code-scanner" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "android-gradle-plugin" }
+android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "android-gradle-plugin" }
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+compose-multiplatform = { id = "org.jetbrains.compose", version.ref = "compose-multiplatform" }
+kotlin-atomicfu = { id = "org.jetbrains.kotlin.plugin.atomicfu", version.ref = "kotlin" }
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }

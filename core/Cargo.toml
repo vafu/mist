@@ -1,0 +1,32 @@
+[package]
+name = "mist-core"
+description = "Shared native runtime for Mist"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait = "=0.1.89"
+base64.workspace = true
+getrandom.workspace = true
+iroh.workspace = true
+iroh-tickets.workspace = true
+prost.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi = "=0.29.4"
+
+[build-dependencies]
+prost-build = "=0.14.4"
+protoc-bin-vendored = "=3.2.0"
+
+[dev-dependencies]
+bytes.workspace = true
+
+[lints]
+workspace = true

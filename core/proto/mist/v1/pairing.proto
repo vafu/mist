@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package mist.v1;
+
+// Opaque invitation encoded for transfer as text or a QR code.
+message PairingOffer {
+  uint32 format_version = 1;
+  string endpoint_ticket = 2;
+  bytes pairing_token = 3;
+  reserved 4;
+}
+
+// First message sent by the invitation holder on a new connection. No device
+// metadata is exchanged until the creator validates this token.
+message PairingAuthenticate {
+  bytes pairing_token = 1;
+}
+
+// Confirms that the token was accepted and consumed.
+message PairingAuthenticated {}
+
+message PairingRejected {
+  PairingRejectionReason reason = 1;
+}
+
+enum PairingRejectionReason {
+  PAIRING_REJECTION_REASON_UNSPECIFIED = 0;
+  PAIRING_REJECTION_REASON_INVALID_TOKEN = 1;
+  reserved 2;
+  PAIRING_REJECTION_REASON_ALREADY_PAIRED = 3;
+  PAIRING_REJECTION_REASON_INCOMPATIBLE = 4;
+}
