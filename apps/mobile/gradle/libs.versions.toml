@@ -1,6 +1,6 @@
 [versions]
 kotlin = "2.4.10"
-android-gradle-plugin = "9.1.0"
+android-gradle-plugin = "9.3.3"
 compose-multiplatform = "1.12.1"
 compose-material3 = "1.12.0-alpha03"
 activity-compose = "1.10.1"
@@ -11,8 +11,6 @@ jna = "5.18.1"
 google-code-scanner = "16.1.0"
 
 [libraries]
-iroh-api = { module = "io.github.vafu:api", version = "0.1.0-SNAPSHOT" }
-iroh-runtime = { module = "io.github.vafu:iroh-runtime", version = "0.1.0-SNAPSHOT" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
 compose-foundation = { module = "org.jetbrains.compose.foundation:foundation", version.ref = "compose-multiplatform" }
 compose-material3 = { module = "org.jetbrains.compose.material3:material3", version.ref = "compose-material3" }

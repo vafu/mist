@@ -1,275 +1,140 @@
-//! Native runtime ownership and construction.
+//! Runtime contracts, construction, and domain errors.
 
 mod builder;
+mod connections;
 mod executor;
+mod service;
 
-use std::sync::{Arc, OnceLock};
+pub(crate) use executor::run_owned;
 
-use crate::pairing::{IrohPairing, Pairing};
-use crate::{DeviceInfo, MIST_ALPN};
-use iroh::endpoint::{BindError, ConnectError, ConnectingError, Connection};
-use iroh::{Endpoint, EndpointAddr};
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use iroh::endpoint::Connection;
+use iroh::{EndpointAddr, EndpointId};
 use thiserror::Error;
-use tokio::runtime::Handle;
+
+use crate::{DeviceError, Devices, Pairing, Peer};
+use tokio_util::sync::CancellationToken;
 
 pub use builder::MistBuilder;
+pub use service::{MistRuntime, create_mist_runtime};
 
-/// Failure while constructing or connecting a Mist runtime.
-#[derive(Debug, Error)]
-pub enum MistError {
-    /// The local Iroh endpoint could not be bound.
-    #[error("failed to bind the Mist endpoint")]
-    Bind(#[from] BindError),
+/// Behavior of one running Mist instance, shared by all hosts.
+///
+/// The runtime owns local networking resources; connections are addressed by
+/// remote endpoint identity. Scheduling is an implementation detail, never a
+/// dependency retrieved by a consumer. Concrete construction belongs to
+/// [`MistBuilder`].
+#[async_trait]
+pub trait Runtime: Send + Sync + Debug {
+    /// Returns the local endpoint address used to reach this instance.
+    fn address(&self) -> EndpointAddr;
 
-    /// An outgoing connection could not be established.
-    #[error("failed to connect to the Mist peer")]
-    Connect(#[from] ConnectError),
+    /// Returns the pairing service for this instance.
+    fn pairing(&self) -> Arc<dyn Pairing>;
 
-    /// An incoming connection failed during its handshake.
-    #[error("failed to accept the Mist peer")]
-    Accept(#[from] ConnectingError),
+    /// Returns saved-device operations over this same core instance.
+    fn devices(&self) -> Arc<dyn Devices>;
 
-    /// The endpoint closed while waiting for an incoming connection.
-    #[error("the Mist endpoint closed before a peer connected")]
-    EndpointClosed,
+    /// Looks up an active connection to a particular remote peer.
+    fn connection(&self, peer: EndpointId) -> Option<Connection>;
 
-    /// The runtime was asked to connect to a different peer after binding its
-    /// one stable connection.
-    #[error("the Mist runtime is already connected to a different peer")]
-    ConnectedToDifferentPeer,
+    /// Reports whether at least one registered peer connection is open.
+    fn is_connected(&self) -> bool;
+
+    /// Opens a connection, exchanges the Mist hello, and registers the peer.
+    ///
+    /// # Errors
+    /// Returns a transport connection error or an endpoint shutdown error.
+    async fn connect(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
+
+    /// Resolves a saved peer by endpoint ID using configured Iroh address lookup.
+    ///
+    /// # Errors
+    /// Returns invalid identity, missing trust, transport, storage or closed errors.
+    async fn reconnect(&self, endpoint_id: String) -> Result<(), RuntimeError>;
+
+    /// Closes this instance's peer connections and endpoint.
+    ///
+    /// Shutdown must not stop an executor shared by other instances. This
+    /// rejects new work, invalidates invitations, and waits for instance-owned
+    /// operations to stop before returning. Repeated shutdown is harmless.
+    ///
+    /// # Errors
+    /// Returns an executor failure if shutdown could not complete.
+    async fn shutdown(&self) -> Result<(), RuntimeError>;
 }
 
-/// Failure exposed while creating the default runtime through `UniFFI`.
-#[derive(Debug, Error, uniffi::Error)]
+/// Transport operations needed by runtime ownership and pairing authorization.
+///
+/// Dialed/accepted candidates are not registered until their owner completes
+/// the required handshake. Metadata and execution handles do not belong here.
+/// Incoming acceptance ownership is internal to the core, not an app concern.
+#[async_trait]
+pub(crate) trait Connections: Send + Sync + Debug {
+    fn address(&self) -> EndpointAddr;
+    async fn dial(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
+    async fn connect(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
+    async fn run(self: Arc<Self>, pairing: Arc<dyn crate::pairing::IncomingPairing>);
+    /// Chooses the same live connection at both ends using TLS-exported rank.
+    fn register(&self, connection: Connection) -> Result<Connection, RuntimeError>;
+    fn trust(
+        &self,
+        peer: Peer,
+        connection: Connection,
+        cancelled: &CancellationToken,
+    ) -> Result<Connection, RuntimeError>;
+    fn forget(&self, peer: EndpointId) -> Result<(), DeviceError>;
+    fn get(&self, peer: EndpointId) -> Option<Connection>;
+    fn is_connected(&self) -> bool;
+    fn close(&self);
+}
+
+/// Runtime failures shared by direct Rust calls and generated bindings.
+#[derive(Clone, Debug, Error, uniffi::Error)]
 pub enum RuntimeError {
-    /// The Rust executor used by foreign-language bindings could not run the
-    /// requested operation.
-    #[error("failed to run the Mist native executor: {reason}")]
-    Executor {
-        /// Human-readable executor failure for diagnostics.
+    /// Identity or trusted-peer storage failed.
+    #[error("device storage failed: {reason}")]
+    Storage {
+        /// Underlying storage diagnostic.
         reason: String,
     },
-
+    /// A connection requires a new pairing invitation.
+    #[error("peer is not trusted: {endpoint_id}")]
+    Untrusted {
+        /// Authenticated remote endpoint identity.
+        endpoint_id: String,
+    },
+    /// A peer did not complete the Mist control handshake.
+    #[error("Mist protocol failed: {reason}")]
+    Protocol {
+        /// Underlying handshake diagnostic.
+        reason: String,
+    },
+    /// The endpoint or instance has closed.
+    #[error("the Mist runtime closed")]
+    Closed,
+    /// An outgoing transport connection failed.
+    #[error("failed to connect: {reason}")]
+    Connect {
+        /// Underlying transport diagnostic.
+        reason: String,
+    },
+    /// Execution of a core operation failed.
+    #[error("failed to run the Mist native executor: {reason}")]
+    Executor {
+        /// Human-readable executor failure.
+        reason: String,
+    },
     /// Iroh could not bind the local endpoint.
     #[error("failed to bind the Mist runtime: {reason}")]
     Bind {
-        /// Human-readable Iroh failure for diagnostics.
+        /// Human-readable bind failure.
         reason: String,
     },
 }
 
-#[derive(Debug)]
-pub(crate) struct Session {
-    endpoint: Endpoint,
-    device_info: DeviceInfo,
-    connection: OnceLock<Connection>,
-    executor: Handle,
-}
-
-impl Session {
-    fn new(endpoint: Endpoint, device_info: DeviceInfo) -> Self {
-        Self {
-            endpoint,
-            device_info,
-            connection: OnceLock::new(),
-            executor: Handle::current(),
-        }
-    }
-
-    pub(crate) fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
-    }
-
-    pub(crate) fn connection(&self) -> Option<&Connection> {
-        self.connection.get()
-    }
-
-    pub(crate) fn device_info(&self) -> &DeviceInfo {
-        &self.device_info
-    }
-
-    pub(crate) fn executor(&self) -> &Handle {
-        &self.executor
-    }
-
-    pub(crate) async fn connect_candidate(
-        &self,
-        peer: EndpointAddr,
-    ) -> Result<Connection, MistError> {
-        let expected_id = peer.id;
-        if let Some(connection) = self.connection.get() {
-            if connection.remote_id() == expected_id {
-                return Ok(connection.clone());
-            }
-            return Err(MistError::ConnectedToDifferentPeer);
-        }
-
-        let connection = self.endpoint.connect(peer, MIST_ALPN).await?;
-        if connection.remote_id() != expected_id {
-            return Err(MistError::ConnectedToDifferentPeer);
-        }
-        Ok(connection)
-    }
-
-    pub(crate) async fn accept_candidate(&self) -> Result<Connection, MistError> {
-        if let Some(connection) = self.connection.get() {
-            return Ok(connection.clone());
-        }
-        let incoming = self
-            .endpoint
-            .accept()
-            .await
-            .ok_or(MistError::EndpointClosed)?;
-        Ok(incoming.await?)
-    }
-
-    pub(crate) fn install(&self, connection: Connection) -> Result<Connection, MistError> {
-        if let Some(existing) = self.connection.get() {
-            return if existing.remote_id() == connection.remote_id() {
-                Ok(existing.clone())
-            } else {
-                Err(MistError::ConnectedToDifferentPeer)
-            };
-        }
-
-        if self.connection.set(connection.clone()).is_ok() {
-            return Ok(connection);
-        }
-
-        let existing = self
-            .connection
-            .get()
-            .expect("another thread initialized the connection");
-        if existing.remote_id() == connection.remote_id() {
-            Ok(existing.clone())
-        } else {
-            Err(MistError::ConnectedToDifferentPeer)
-        }
-    }
-
-    pub(crate) async fn connect(&self, peer: EndpointAddr) -> Result<Connection, MistError> {
-        let candidate = self.connect_candidate(peer).await?;
-        self.install(candidate)
-    }
-
-    pub(crate) async fn accept(&self) -> Result<Connection, MistError> {
-        let candidate = self.accept_candidate().await?;
-        self.install(candidate)
-    }
-
-    async fn close(&self) {
-        if let Some(connection) = self.connection.get() {
-            connection.close(0_u32.into(), b"Mist runtime closed");
-        }
-        self.endpoint.close().await;
-    }
-}
-
-/// Root object for one running Mist instance.
-///
-/// A runtime owns one Iroh endpoint and installs at most one stable peer
-/// connection. `UniFFI` exposes the same Rust allocation to Kotlin as an object
-/// proxy; it does not construct a second runtime.
-#[derive(Debug, uniffi::Object)]
-pub struct MistRuntime {
-    session: Arc<Session>,
-    pairing: Arc<dyn Pairing>,
-}
-
-impl MistRuntime {
-    pub(crate) fn from_endpoint(endpoint: Endpoint, device_info: DeviceInfo) -> Arc<Self> {
-        let session = Arc::new(Session::new(endpoint, device_info));
-        let pairing = Arc::new(IrohPairing::new(Arc::clone(&session)));
-        Arc::new(Self { session, pairing })
-    }
-
-    /// Returns the Iroh endpoint owned by this runtime.
-    #[must_use]
-    pub fn endpoint(&self) -> &Endpoint {
-        self.session.endpoint()
-    }
-
-    /// Returns the runtime's stable connection after pairing completes.
-    #[must_use]
-    pub fn connection(&self) -> Option<&Connection> {
-        self.session.connection()
-    }
-
-    /// Connects this runtime to a known peer outside of the pairing facade.
-    ///
-    /// This lower-level Rust API is used by the CLI bootstrap and tests.
-    /// Mobile hosts should use [`Pairing::accept`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an Iroh connection error, or
-    /// [`MistError::ConnectedToDifferentPeer`] if another peer won the runtime's
-    /// connection slot.
-    pub async fn connect(&self, peer: impl Into<EndpointAddr>) -> Result<Connection, MistError> {
-        self.session.connect(peer.into()).await
-    }
-
-    /// Accepts the next connection outside of the pairing facade.
-    ///
-    /// # Errors
-    ///
-    /// Returns an Iroh handshake error or [`MistError::EndpointClosed`].
-    pub async fn accept(&self) -> Result<Connection, MistError> {
-        self.session.accept().await
-    }
-}
-
-#[uniffi::export]
-impl MistRuntime {
-    /// Returns this runtime's pairing service.
-    #[must_use]
-    pub fn pairing(&self) -> Arc<dyn Pairing> {
-        Arc::clone(&self.pairing)
-    }
-
-    /// Returns the local Iroh endpoint identity.
-    ///
-    /// The iroh-kmp endpoint wrapper will replace this convenience method once
-    /// native handle sharing is wired.
-    #[must_use]
-    pub fn endpoint_id(&self) -> String {
-        self.session.endpoint.id().to_string()
-    }
-
-    /// Reports whether pairing has installed the runtime's connection.
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.session.connection.get().is_some()
-    }
-
-    /// Shuts down the stable connection, if present, and then the endpoint.
-    pub async fn shutdown(&self) {
-        let session = Arc::clone(&self.session);
-        let executor = session.executor().clone();
-        let _ = executor.spawn(async move { session.close().await }).await;
-    }
-}
-
-/// Creates the default production runtime for mobile bindings.
-///
-/// Platform capabilities and custom Iroh transports will become additional
-/// parameters of the mobile composition factory.
-///
-/// # Errors
-///
-/// Returns [`RuntimeError::Bind`] if Iroh cannot bind the endpoint.
-#[uniffi::export]
-pub async fn create_mist_runtime(
-    device_info: DeviceInfo,
-) -> Result<Arc<MistRuntime>, RuntimeError> {
-    executor::run(async move {
-        MistBuilder::new(device_info)
-            .bind()
-            .await
-            .map_err(|error| RuntimeError::Bind {
-                reason: error.to_string(),
-            })
-    })
-    .await
-    .map_err(|reason| RuntimeError::Executor { reason })?
-}
+#[cfg(test)]
+mod test;

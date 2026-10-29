@@ -1,9 +1,12 @@
 use std::env;
 use std::error::Error;
 use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use iroh::EndpointId;
-use mist_core::{DeviceClass, DeviceInfo, MistBuilder, MistRuntime, Platform};
+use iroh::endpoint::Connection;
+use mist_core::{DeviceInfo, FileStore, MistBuilder, MistRuntime, Platform, Runtime};
 use qrcode::QrCode;
 use qrcode::render::unicode;
 
@@ -18,7 +21,53 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next();
-    let bound = match command.as_deref() {
+    if matches!(command.as_deref(), Some("devices" | "device" | "forget")) {
+        let command = command.as_deref().unwrap();
+        let id = arguments.next();
+        if arguments.next().is_some()
+            || (command == "devices" && id.is_some())
+            || (command != "devices" && id.is_none())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "use devices, device <endpoint-id>, or forget <endpoint-id>",
+            )
+            .into());
+        }
+        let runtime = bind_runtime().await?;
+        let result: Result<(), Box<dyn Error>> = (|| {
+            let devices = runtime.devices();
+            if command == "forget" {
+                devices.forget(id.unwrap())?;
+                println!("device forgotten");
+            } else {
+                let peers = devices.peers()?;
+                if let Some(id) = id {
+                    let peer = peers
+                        .into_iter()
+                        .find(|peer| peer.endpoint_id == id)
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "device is not saved")
+                        })?;
+                    println!(
+                        "{}\n{}\n{:?}",
+                        peer.device.display_name, peer.endpoint_id, peer.device.platform
+                    );
+                } else {
+                    for peer in peers {
+                        println!(
+                            "{}\t{}\t{:?}",
+                            peer.endpoint_id, peer.device.display_name, peer.device.platform
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        runtime.shutdown().await?;
+        return result;
+    }
+    let (bound, connection) = match command.as_deref() {
         Some("pair") => {
             if arguments.next().is_some() {
                 return Err(io::Error::new(
@@ -52,24 +101,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let connection = bound
-        .connection()
-        .expect("the runtime installs its connection before returning");
-    println!("connected to {}", connection.remote_id());
+    if let Some(connection) = &connection {
+        println!("connected to {}", connection.remote_id());
+    }
     println!("press Ctrl-C to stop");
 
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
-        reason = connection.closed() => {
+        reason = async { match &connection { Some(connection) => connection.closed().await, None => std::future::pending().await } } => {
             println!("connection closed: {reason}");
         }
     }
-    bound.shutdown().await;
+    bound.shutdown().await?;
     Ok(())
 }
 
-async fn initiate_pairing() -> Result<std::sync::Arc<MistRuntime>, Box<dyn Error>> {
-    let runtime = MistBuilder::new(local_device_info()).bind().await?;
+async fn initiate_pairing()
+-> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
+    let runtime = bind_runtime().await?;
     let pairing = runtime.pairing();
     let offer = pairing.initiate()?;
     match QrCode::new(offer.encoded.as_bytes()) {
@@ -90,22 +139,26 @@ async fn initiate_pairing() -> Result<std::sync::Arc<MistRuntime>, Box<dyn Error
         "paired with {} ({})",
         peer.device.display_name, peer.endpoint_id
     );
-    Ok(runtime)
+    let connection = runtime
+        .connection(peer.endpoint_id.parse()?)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "paired peer disconnected"))?;
+    Ok((runtime, Some(connection)))
 }
 
-async fn listen() -> Result<std::sync::Arc<MistRuntime>, Box<dyn Error>> {
-    let runtime = MistBuilder::new(local_device_info()).bind().await?;
-    println!("endpoint: {}", runtime.endpoint().id());
+async fn listen() -> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
+    let runtime = bind_runtime().await?;
+    println!("endpoint: {}", runtime.endpoint_id());
     println!("waiting for peer");
-    runtime.accept().await?;
-    Ok(runtime)
+    Ok((runtime, None))
 }
 
-async fn connect(peer: EndpointId) -> Result<std::sync::Arc<MistRuntime>, Box<dyn Error>> {
-    let runtime = MistBuilder::new(local_device_info()).bind().await?;
-    println!("endpoint: {}", runtime.endpoint().id());
-    runtime.connect(peer).await?;
-    Ok(runtime)
+async fn connect(
+    peer: EndpointId,
+) -> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
+    let runtime = bind_runtime().await?;
+    println!("endpoint: {}", runtime.endpoint_id());
+    let connection = runtime.connect(peer.into()).await?;
+    Ok((runtime, Some(connection)))
 }
 
 fn print_usage() {
@@ -113,6 +166,30 @@ fn print_usage() {
     eprintln!("  mist pair");
     eprintln!("  mist listen");
     eprintln!("  mist connect <endpoint-id>");
+    eprintln!("  mist devices");
+    eprintln!("  mist device <endpoint-id>");
+    eprintln!("  mist forget <endpoint-id>");
+}
+
+async fn bind_runtime() -> Result<Arc<MistRuntime>, Box<dyn Error>> {
+    let directory = if let Some(path) = env::var_os("MIST_STATE_DIR") {
+        PathBuf::from(path)
+    } else if let Some(path) = env::var_os("XDG_STATE_HOME") {
+        PathBuf::from(path).join("mist")
+    } else {
+        PathBuf::from(env::var_os("HOME").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HOME or MIST_STATE_DIR must be set",
+            )
+        })?)
+        .join(".local/state/mist")
+    };
+    let store = Arc::new(FileStore::open(directory)?);
+    Ok(MistBuilder::new(local_device_info())
+        .store(store)
+        .bind()
+        .await?)
 }
 
 fn local_device_info() -> DeviceInfo {
@@ -123,7 +200,6 @@ fn local_device_info() -> DeviceInfo {
         .unwrap_or_else(|| "Mist CLI".to_owned());
     DeviceInfo {
         display_name,
-        device_class: DeviceClass::Desktop,
         platform: Platform::Linux,
     }
 }

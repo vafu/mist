@@ -4,33 +4,10 @@ package mist.v1;
 
 import "mist/v1/device.proto";
 
-// Sent after pairing authorization and on every subsequent connection.
+// Sent after pairing authorization.
 message SessionHello {
   uint32 protocol_version = 1;
   DeviceInfo device = 2;
-  CapabilitySnapshot capabilities = 3;
-}
-
-message CapabilitySnapshot {
-  repeated Capability capabilities = 1;
-}
-
-// A named, independently versioned feature and its current directional state.
-message Capability {
-  string id = 1;
-  uint32 protocol_version = 2;
-  CapabilityState source_state = 3;
-  CapabilityState sink_state = 4;
-}
-
-enum CapabilityState {
-  CAPABILITY_STATE_UNSUPPORTED = 0;
-  CAPABILITY_STATE_ENABLED = 1;
-  CAPABILITY_STATE_DISABLED = 2;
-  CAPABILITY_STATE_UNAVAILABLE = 3;
-}
-
-// Updates one feature after its permission, provider, or user policy changes.
-message CapabilityChanged {
-  Capability capability = 1;
+  reserved 3;
+  reserved "capabilities";
 }

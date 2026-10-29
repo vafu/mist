@@ -95,7 +95,6 @@ kotlin {
             kotlin.srcDir(bindingsOutput.map { it.dir("commonMain/kotlin") })
         }
         commonMain.dependencies {
-            api(libs.iroh.runtime)
             implementation(libs.compose.foundation)
             implementation(libs.compose.material3)
             implementation(libs.compose.runtime)

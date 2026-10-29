@@ -3,33 +3,11 @@ plugins {
     alias(libs.plugins.compose.compiler)
 }
 
-val irohRepository = rootProject.projectDir.resolve("../../../iroh-kmp")
 val mistRepository = rootProject.projectDir.resolve("../..")
 val nativeOutput = layout.buildDirectory.dir("native/android")
 val androidSdk = providers.environmentVariable("ANDROID_HOME")
     .orElse("${System.getProperty("user.home")}/Android/Sdk")
 val androidNdk = androidSdk.map { "$it/ndk/30.0.16248370" }
-
-val buildIrohNative by tasks.registering(Exec::class) {
-    group = "build"
-    description = "Builds the Rust Iroh runtime for Android arm64"
-    workingDir(irohRepository)
-    environment("ANDROID_HOME", androidSdk.get())
-    environment("ANDROID_NDK_HOME", androidNdk.get())
-    commandLine(
-        "cargo", "ndk",
-        "--target", "arm64-v8a",
-        "--platform", "26",
-        "--output-dir", nativeOutput.get().asFile,
-        "build", "--release", "--package", "iroh-kmp-native",
-    )
-    inputs.files(
-        irohRepository.resolve("Cargo.toml"),
-        irohRepository.resolve("Cargo.lock"),
-    )
-    inputs.dir(irohRepository.resolve("iroh-runtime/native/src"))
-    outputs.file(nativeOutput.map { it.file("arm64-v8a/libiroh_kmp_native.so") })
-}
 
 val buildMistNative by tasks.registering(Exec::class) {
     group = "build"
@@ -78,7 +56,7 @@ android {
     sourceSets.getByName("main").jniLibs.directories.add(nativeOutput.get().asFile.absolutePath)
 }
 
-tasks.named("preBuild").configure { dependsOn(buildIrohNative, buildMistNative) }
+tasks.named("preBuild").configure { dependsOn(buildMistNative) }
 
 dependencies {
     implementation(project(":"))

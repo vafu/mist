@@ -12,20 +12,28 @@ implementations, cross-compiles `libmist_core.so`, and packages it in the APK.
 The current root API is generated from Rust:
 
 ```kotlin
-val runtime: MistRuntime = createMistRuntime(deviceInfo)
+val runtime: MistRuntime = createMistRuntime(deviceInfo, storageDirectory)
 val pairing: Pairing = runtime.pairing()
+val devices: Devices = runtime.devices()
 ```
 
-`MistRuntime` owns the endpoint before pairing and retains the stable connection
-after pairing. The Android launcher supplies its model, device class, and
-platform to the shared runtime. Future platform providers and Iroh custom
-transports will be additional parameters of the runtime composition factory.
+`MistRuntime` owns the endpoint before pairing and registers authorized connections
+by peer identity. The Android launcher supplies its model and platform to the
+shared runtime.
+
+The Android launcher supplies `filesDir/mist` as the persistent state directory.
+Local identity and trusted peer records survive restart. Saved peers are listed
+with their metadata and endpoint identity; reconnect and forget call the shared
+core contracts directly. Blocking storage queries run off the UI thread. An
+Android ViewModel retains the Rust handle across configuration changes and awaits
+shutdown in a non-cancellable cleanup block when its lifecycle ends. The shared
+composable renders the supplied core handle; it does not create domain state.
+
+The application packages only `libmist_core` and its native dependencies. There
+is no required sibling `iroh-kmp` checkout. The pinned AGP 9.3.3 supports SDK 37;
+the arm64 Rust library is built with cargo-ndk and NDK 30.0.16248370.
 
 Android pairing opens Google Code Scanner in QR-only mode and passes the
 decoded `mist:pair:1:...` payload directly to the native pairing service. The
 scanner is callback-driven and does not require Mist to request camera
 permission. The text field remains available as a debugging fallback.
-
-Feature bindings for notifications, clipboard, and file transfer will share
-the same native runtime handle. Generic Iroh operations will continue to use
-iroh-kmp wrappers rather than being duplicated in Mist's API.

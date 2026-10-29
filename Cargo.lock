@@ -1759,9 +1759,13 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
+ "serde",
+ "serde_json",
  "subtle",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "uniffi",
 ]
 

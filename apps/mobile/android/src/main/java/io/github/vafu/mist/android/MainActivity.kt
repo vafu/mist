@@ -1,25 +1,17 @@
 package io.github.vafu.mist.android
 
-import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import io.github.vafu.mist.MistApp
-import io.github.vafu.mist.core.DeviceClass
-import io.github.vafu.mist.core.DeviceInfo
-import io.github.vafu.mist.core.Platform
 
 public class MainActivity : ComponentActivity() {
+    private val model: MistViewModel by viewModels()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            MistApp(
-                DeviceInfo(
-                    displayName = Build.MODEL,
-                    deviceClass = DeviceClass.PHONE,
-                    platform = Platform.ANDROID,
-                ),
-            )
+            MistApp(model.runtime, model.error)
         }
     }
 }

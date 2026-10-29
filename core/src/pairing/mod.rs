@@ -10,7 +10,8 @@ use std::fmt::Debug;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::DeviceInfo;
+use crate::Peer;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
 
 pub(crate) use service::IrohPairing;
 
@@ -21,18 +22,15 @@ pub struct PairingOffer {
     pub encoded: String,
 }
 
-/// The authenticated Iroh peer installed into the Mist runtime.
-#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
-pub struct PairedPeer {
-    /// The peer's stable Iroh endpoint identity.
-    pub endpoint_id: String,
-    /// Device metadata received after pairing authorization succeeded.
-    pub device: DeviceInfo,
-}
-
 /// A pairing operation could not be completed.
-#[derive(Debug, Error, uniffi::Error)]
+#[derive(Clone, Debug, Error, uniffi::Error)]
 pub enum PairingError {
+    /// Durable trust could not be saved locally.
+    #[error("failed to store peer trust: {reason}")]
+    Storage {
+        /// Underlying storage diagnostic.
+        reason: String,
+    },
     /// The invitation was not a supported Mist pairing payload.
     #[error("invalid Mist pairing offer: {reason}")]
     InvalidOffer {
@@ -69,20 +67,9 @@ pub enum PairingError {
         reason: String,
     },
 
-    /// The runtime already belongs to a session with another peer.
-    #[error("the Mist runtime is already paired with another peer")]
-    AlreadyPaired,
-
     /// Iroh could not establish the outgoing connection.
     #[error("failed to connect to the pairing peer: {reason}")]
     Connect {
-        /// Human-readable Iroh failure for diagnostics.
-        reason: String,
-    },
-
-    /// An incoming Iroh connection failed during its handshake.
-    #[error("failed to accept the pairing peer: {reason}")]
-    Accept {
         /// Human-readable Iroh failure for diagnostics.
         reason: String,
     },
@@ -100,7 +87,7 @@ pub enum PairingError {
     },
 }
 
-/// Establishes the one peer relationship owned by a [`MistRuntime`](crate::MistRuntime).
+/// Authorizes a new peer using a single-use invitation.
 ///
 /// Hosts receive this interface from [`MistRuntime::pairing`](crate::MistRuntime::pairing).
 /// Implementations live in Rust; UniFFI/Gobley generates the corresponding
@@ -115,8 +102,8 @@ pub trait Pairing: Send + Sync + Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error if a peer is already installed, secure randomness is
-    /// unavailable, or the local pairing state cannot be updated.
+    /// Returns an error if secure randomness is unavailable or the local
+    /// pairing state cannot be updated.
     fn initiate(&self) -> Result<PairingOffer, PairingError>;
 
     /// Invalidates the active invitation, if any.
@@ -124,15 +111,25 @@ pub trait Pairing: Send + Sync + Debug {
 
     /// Accepts an invitation created by another Mist runtime.
     ///
-    /// On success, the resulting Iroh connection becomes the runtime's one
-    /// stable connection.
-    async fn accept(&self, offer: PairingOffer) -> Result<PairedPeer, PairingError>;
+    /// On success, registers the authorized connection by remote endpoint ID.
+    async fn accept(&self, offer: PairingOffer) -> Result<Peer, PairingError>;
 
     /// Waits for the peer holding this runtime's invitation to connect.
     ///
-    /// On success, the accepted Iroh connection becomes the runtime's one
-    /// stable connection.
-    async fn wait_for_peer(&self) -> Result<PairedPeer, PairingError>;
+    /// On success, registers the authorized connection by remote endpoint ID.
+    async fn wait_for_peer(&self) -> Result<Peer, PairingError>;
+}
+
+/// Authorization of a candidate supplied by the core's single accept owner.
+#[async_trait]
+pub(crate) trait IncomingPairing: Send + Sync + Debug {
+    async fn authorize(
+        &self,
+        connection: Connection,
+        send: SendStream,
+        recv: RecvStream,
+        token: Vec<u8>,
+    ) -> Result<(), PairingError>;
 }
 
 #[cfg(test)]

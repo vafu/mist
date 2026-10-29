@@ -17,5 +17,3 @@ dependencyResolutionManagement {
 rootProject.name = "mist-mobile"
 
 include(":android")
-
-includeBuild("../../../iroh-kmp")

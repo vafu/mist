@@ -6,8 +6,8 @@ use iroh::endpoint::presets;
 use iroh::endpoint::transports::CustomTransport;
 use iroh::{Endpoint, RelayMode, SecretKey};
 
-use super::{MistError, MistRuntime};
-use crate::{DeviceInfo, MIST_ALPN};
+use super::{MistRuntime, RuntimeError, executor};
+use crate::{DeviceInfo, DeviceStore, MIST_ALPN, MemoryStore};
 
 /// Configures the Iroh endpoint owned by a [`MistRuntime`].
 ///
@@ -18,6 +18,8 @@ use crate::{DeviceInfo, MIST_ALPN};
 pub struct MistBuilder {
     endpoint: Builder,
     device_info: DeviceInfo,
+    identity: Option<SecretKey>,
+    store: Option<Arc<dyn DeviceStore>>,
 }
 
 impl MistBuilder {
@@ -27,13 +29,23 @@ impl MistBuilder {
         Self {
             endpoint: Endpoint::builder(presets::N0).alpns(vec![MIST_ALPN.to_vec()]),
             device_info,
+            identity: None,
+            store: None,
         }
     }
 
     /// Uses an existing Iroh identity instead of generating a new one.
     #[must_use]
     pub fn secret_key(mut self, secret_key: SecretKey) -> Self {
-        self.endpoint = self.endpoint.secret_key(secret_key);
+        self.identity = Some(secret_key);
+        self
+    }
+
+    /// Uses persistent or test storage for identity and trusted peer records.
+    /// Without this option, the builder uses isolated ephemeral storage.
+    #[must_use]
+    pub fn store(mut self, store: Arc<dyn DeviceStore>) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -67,10 +79,50 @@ impl MistBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`MistError::Bind`] when Iroh cannot bind the configured
+    /// Returns [`RuntimeError::Bind`] when Iroh cannot bind the configured
     /// endpoint.
-    pub async fn bind(self) -> Result<Arc<MistRuntime>, MistError> {
-        let endpoint = self.endpoint.bind().await?;
-        Ok(MistRuntime::from_endpoint(endpoint, self.device_info))
+    pub async fn bind(self) -> Result<Arc<MistRuntime>, RuntimeError> {
+        executor::run(async move {
+            let storage_error = |error: crate::DeviceError| RuntimeError::Storage {
+                reason: error.to_string(),
+            };
+            let store = if let Some(store) = self.store {
+                store
+            } else {
+                let identity = if let Some(identity) = &self.identity {
+                    identity.clone()
+                } else {
+                    let mut bytes = [0; 32];
+                    getrandom::fill(&mut bytes).map_err(|error| RuntimeError::Storage {
+                        reason: format!("generate identity: {error}"),
+                    })?;
+                    SecretKey::from_bytes(&bytes)
+                };
+                Arc::new(MemoryStore::new(identity)) as Arc<dyn DeviceStore>
+            };
+            let identity = store.identity().map_err(storage_error)?;
+            store.peers().map_err(storage_error)?;
+            if let Some(explicit) = self.identity
+                && explicit.public() != identity.public()
+            {
+                return Err(RuntimeError::Storage {
+                    reason: "explicit key differs from stored identity".to_owned(),
+                });
+            }
+            let endpoint = self
+                .endpoint
+                .secret_key(identity)
+                .bind()
+                .await
+                .map_err(|error| RuntimeError::Bind {
+                    reason: error.to_string(),
+                })?;
+            Ok(MistRuntime::from_endpoint(
+                endpoint,
+                self.device_info,
+                store,
+            ))
+        })
+        .await?
     }
 }

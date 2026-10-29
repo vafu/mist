@@ -6,26 +6,16 @@ package mist.v1;
 // the remote endpoint has been authorized.
 message DeviceInfo {
   string display_name = 1;
-  DeviceClass device_class = 2;
+  reserved 2;
+  reserved "device_class";
   Platform platform = 3;
-}
-
-enum DeviceClass {
-  DEVICE_CLASS_UNSPECIFIED = 0;
-  DEVICE_CLASS_PHONE = 1;
-  DEVICE_CLASS_TABLET = 2;
-  DEVICE_CLASS_LAPTOP = 3;
-  DEVICE_CLASS_DESKTOP = 4;
-  DEVICE_CLASS_SERVER = 5;
-  DEVICE_CLASS_OTHER = 6;
 }
 
 enum Platform {
   PLATFORM_UNSPECIFIED = 0;
   PLATFORM_ANDROID = 1;
   PLATFORM_LINUX = 2;
-  PLATFORM_IOS = 3;
-  PLATFORM_MACOS = 4;
-  PLATFORM_WINDOWS = 5;
+  reserved 3, 4, 5;
+  reserved "PLATFORM_IOS", "PLATFORM_MACOS", "PLATFORM_WINDOWS";
   PLATFORM_OTHER = 6;
 }

@@ -7,11 +7,12 @@ import "mist/v1/session.proto";
 
 // One length-delimited message on Mist's control stream.
 message ControlFrame {
+  reserved 5;
+  reserved "capability_changed";
   oneof body {
     PairingAuthenticate pairing_authenticate = 1;
     PairingAuthenticated pairing_authenticated = 2;
     PairingRejected pairing_rejected = 3;
     SessionHello session_hello = 4;
-    CapabilityChanged capability_changed = 5;
   }
 }
