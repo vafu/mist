@@ -5,7 +5,7 @@
       <stop offset="0" stop-color="#35302a"/>
       <stop offset="1" stop-color="#181716"/>
     </linearGradient>
-    <linearGradient id="ink" x1="0" y1="300" x2="0" y2="830" gradientUnits="userSpaceOnUse">
+    <linearGradient id="ink" x1="0" y1="280" x2="0" y2="800" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#f3e6c9"/>
       <stop offset="1" stop-color="#c0a675"/>
     </linearGradient>
@@ -14,24 +14,29 @@
   <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
 
   <g fill="none" stroke="url(#ink)" stroke-linecap="round" stroke-linejoin="round">
-    <!-- arch -->
-    <path d="M176 700 C 236 420, 372 330, 512 330
-             C 652 330, 788 420, 848 700" stroke-width="38"/>
+    <!-- cable: gentle anchors, tall towers, deep centre sag -->
+    <path d="M120 706 C 178 640, 240 470, 300 330
+             C 380 640, 460 690, 512 690
+             C 564 690, 644 640, 724 330
+             C 784 470, 846 640, 904 706" stroke-width="26"/>
 
     <!-- hangers -->
-    <path d="M276 596 L276 676" stroke-width="16"/>
-    <path d="M356 494 L356 676" stroke-width="16"/>
-    <path d="M436 420 L436 676" stroke-width="16"/>
-    <path d="M512 396 L512 676" stroke-width="16"/>
-    <path d="M588 420 L588 676" stroke-width="16"/>
-    <path d="M668 494 L668 676" stroke-width="16"/>
-    <path d="M748 596 L748 676" stroke-width="16"/>
+    <path d="M392 566 L392 692" stroke-width="13"/>
+    <path d="M452 640 L452 692" stroke-width="13"/>
+    <path d="M572 640 L572 692" stroke-width="13"/>
+    <path d="M632 566 L632 692" stroke-width="13"/>
+
+    <!-- towers -->
+    <path d="M300 306 L300 800" stroke-width="40"/>
+    <path d="M724 306 L724 800" stroke-width="40"/>
+    <path d="M266 306 L334 306" stroke-width="28"/>
+    <path d="M690 306 L758 306" stroke-width="28"/>
 
     <!-- deck -->
-    <path d="M176 700 L848 700" stroke-width="42"/>
+    <path d="M120 706 L904 706" stroke-width="38"/>
 
     <!-- approach ramps -->
-    <path d="M176 700 L110 786" stroke-width="30"/>
-    <path d="M848 700 L914 786" stroke-width="30"/>
+    <path d="M120 706 L66 796" stroke-width="26"/>
+    <path d="M904 706 L958 796" stroke-width="26"/>
   </g>
 </svg>
