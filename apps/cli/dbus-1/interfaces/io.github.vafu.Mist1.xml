@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<node>
+  <interface name="io.github.vafu.Mist1">
+    <method name="StartPairing">
+      <arg name="offer" type="s" direction="out"/>
+    </method>
+    <method name="CancelPairing"/>
+    <method name="SelectDevice">
+      <arg name="endpoint_id" type="s" direction="in"/>
+      <arg name="selected" type="b" direction="in"/>
+    </method>
+    <method name="ConnectDevice">
+      <arg name="endpoint_id" type="s" direction="in"/>
+    </method>
+    <method name="DisconnectDevice">
+      <arg name="endpoint_id" type="s" direction="in"/>
+    </method>
+    <method name="ForgetDevice">
+      <arg name="endpoint_id" type="s" direction="in"/>
+    </method>
+    <method name="PushNotification">
+      <arg name="title" type="s" direction="in"/>
+      <arg name="body" type="s" direction="in"/>
+    </method>
+    <method name="Shutdown"/>
+
+    <property name="EndpointId" type="s" access="read">
+      <annotation name="org.freedesktop.DBus.Property.EmitsChangedSignal" value="const"/>
+    </property>
+    <property name="Devices" type="a(ssssssb)" access="read"/>
+    <property name="Connected" type="b" access="read"/>
+
+    <signal name="DeviceChanged">
+      <arg name="endpoint_id" type="s"/>
+    </signal>
+    <signal name="NotificationReceived">
+      <arg name="endpoint_id" type="s"/>
+      <arg name="application" type="s"/>
+      <arg name="title" type="s"/>
+      <arg name="body" type="s"/>
+    </signal>
+    <signal name="PairingFailed">
+      <arg name="reason" type="s"/>
+    </signal>
+  </interface>
+</node>

@@ -1,4 +1,4 @@
-package_name = "io.github.vafu.mist.core"
+package_name = "io.github.vafu.mist.host"
 cdylib_name = "mist_core"
 kotlin_multiplatform = true
 kotlin_targets = ["android"]

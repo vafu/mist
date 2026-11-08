@@ -10,11 +10,24 @@ publish = false
 name = "mist"
 path = "src/main.rs"
 
+[[bin]]
+name = "mistd"
+path = "src/bin/mistd.rs"
+
+[lib]
+name = "mist_linux"
+path = "src/lib.rs"
+
 [dependencies]
+futures-util.workspace = true
 iroh.workspace = true
 mist-core = { path = "../../core" }
+mist-app-contract = { path = "../../core/app-contract" }
 qrcode.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+wl-clipboard-rs.workspace = true
+zbus.workspace = true
 
 [lints]
 workspace = true

@@ -2,13 +2,14 @@
 
 Mist is an Iroh-based bridge between devices and an alternative to KDE
 Connect. The shared runtime and native applications are written in Rust.
-Platform bindings reuse the same Rust-owned Iroh endpoint and peer connections.
+Platform bindings reuse the same Rust-owned Iroh endpoint and connection.
 
 The bootstrap currently contains:
 
-- `core`, the Rust `mist-core` crate: trait-backed runtime, concurrent peer
-  connections, persistent identities and trusted devices, pairing and reconnect.
-- `apps/cli`, the fully Rust `mist` CLI.
+- `core/app-contract`, the dependency-light public Rust/UniFFI API.
+- `core`, the private Rust runtime implementation, which owns Iroh, SQLite
+  persistence, the multi-device registry, and feature implementations.
+- `apps/cli`, the Rust `mistd` Linux daemon and its thin D-Bus client, `mist`.
 - `apps/mobile`, the shared KMP mobile application and generated UniFFI API.
 - `apps/mobile/android`, the thin Android launcher and package.
 
@@ -27,45 +28,52 @@ cd apps/mobile
 ./gradlew check :android:assembleDebug
 ```
 
-The mobile build uses Gobley to generate Kotlin bindings from the Rust API and
-packages the arm64 Android core. Set `ANDROID_HOME` to your SDK directory.
-Install the `aarch64-linux-android` Rust target, `cargo-ndk`, and NDK
-`30.0.16248370` for native builds. SDK 37 and Java 21 are used by the pinned build.
+The mobile build consumes `../../../iroh-kmp` as an included source build and
+uses Gobley to generate Kotlin bindings from both Rust crates. Set
+`ANDROID_HOME` when that repository does not have its own `local.properties`.
+The Android foreground service runs in a dedicated `:mist` process; the
+activity is a Binder-backed controller and does not own native state.
 
-Start pairing from the CLI. It prints both a terminal QR code and the opaque
-invitation text:
-
-```sh
-cargo run -p mist-cli -- pair
-```
-
-To pair with Android, use the app's QR scanner or paste the decoded invitation
-into its text field. The authorization token is single-use
-and remains active until it is consumed, replaced, cancelled, or the runtime
-shuts down.
-
-## Saved devices
-
-The CLI keeps its local identity and trusted peers under
-`$XDG_STATE_HOME/mist` (or `~/.local/state/mist`). Override this with
-`MIST_STATE_DIR`. Android uses its private `files/mist` directory. Each directory
-has one active writer; shutdown releases the instance, and dropping its handles
-releases the storage lock.
+Run the Linux daemon, then start pairing from the D-Bus CLI. `mist pair`
+returns immediately after printing both a terminal QR code and the opaque
+invitation text; `mistd` continues accepting it in the background:
 
 ```sh
-cargo run -p mist-cli -- devices
-cargo run -p mist-cli -- device <endpoint-id>
-cargo run -p mist-cli -- forget <endpoint-id>
-cargo run -p mist-cli -- listen
-cargo run -p mist-cli -- connect <trusted-endpoint-id>
+cargo run -p mist-cli --bin mistd
+cargo run -p mist-cli --bin mist -- pair
 ```
 
-Saved peers remain available while offline. After restart, either side can
-initiate reconnect without another invitation; both installations must retain
-trust. `listen` keeps the core running to accept trusted peers. The Android UI
-lists saved peers and provides reconnect, details and forget controls.
-Forgetting removes local trust and closes the connection; the peer needs a fresh
-invitation to pair again. Automatic reconnect retry is not implemented.
+To pair with Android, scan the QR code in the app or paste the invitation into
+its debug field. Its authorization token is single-use and remains active until
+it is consumed, replaced, cancelled, or the runtime shuts down.
+
+The Linux D-Bus service is `io.github.vafu.Mist`, at
+`/io/github/vafu/Mist`, with interface `io.github.vafu.Mist1`. Packaging files
+for D-Bus and systemd user activation live under `apps/cli/dbus-1` and
+`apps/cli/systemd/user`. Useful commands include:
+
+```sh
+mist status
+mist devices
+mist select <endpoint-id>
+mist connect <endpoint-id>
+mist disconnect <endpoint-id>
+mist forget <endpoint-id>
+mist notify "Title" "Body"
+mist watch
+```
+
+On Linux, `mistd` monitors calls to the standard desktop notification service
+and forwards them to selected devices. Notifications received from a peer are
+published through that same desktop service. On Android, a
+`NotificationListenerService` forwards local notifications into the Rust
+channel, while remote notifications are posted through Android's native
+notification manager. Mist filters its own Android notifications to prevent
+echo loops.
+
+Rust persists the Iroh identity, trusted devices, selection state, and internal
+address records in SQLite. Linux uses `$XDG_STATE_HOME/mist` (falling back to
+`$HOME/.local/state/mist`); Android uses its app-private files directory.
 
 See [the architecture notes](docs/architecture.md) for the native/KMP ownership
 boundary.

@@ -6,8 +6,10 @@ use iroh::endpoint::presets;
 use iroh::endpoint::transports::CustomTransport;
 use iroh::{Endpoint, RelayMode, SecretKey};
 
-use super::{MistRuntime, RuntimeError, executor};
-use crate::{DeviceInfo, DeviceStore, MIST_ALPN, MemoryStore};
+use super::address_publisher::{LocalAddressPublisher, PublishedAddresses};
+use super::{MistError, MistRuntime};
+use crate::storage::{SqliteStateStore, StateStore};
+use crate::{DeviceInfo, MIST_ALPN};
 
 /// Configures the Iroh endpoint owned by a [`MistRuntime`].
 ///
@@ -18,46 +20,54 @@ use crate::{DeviceInfo, DeviceStore, MIST_ALPN, MemoryStore};
 pub struct MistBuilder {
     endpoint: Builder,
     device_info: DeviceInfo,
-    identity: Option<SecretKey>,
-    store: Option<Arc<dyn DeviceStore>>,
+    store: Arc<dyn StateStore>,
+    local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
+    blob_directory: std::path::PathBuf,
 }
 
 impl MistBuilder {
     /// Creates a production endpoint configuration accepting the Mist ALPN.
     #[must_use]
     pub fn new(device_info: DeviceInfo) -> Self {
+        let (publisher, local_addresses) = LocalAddressPublisher::new();
         Self {
-            endpoint: Endpoint::builder(presets::N0).alpns(vec![MIST_ALPN.to_vec()]),
+            endpoint: Endpoint::builder(presets::N0)
+                .alpns(vec![MIST_ALPN.to_vec()])
+                .address_lookup(publisher),
             device_info,
-            identity: None,
-            store: None,
+            store: Arc::new(
+                SqliteStateStore::in_memory().expect("in-memory SQLite initialization must work"),
+            ),
+            local_addresses,
+            blob_directory: std::env::temp_dir().join("mist-clipboard"),
         }
+    }
+
+    /// Sets the app-private directory used for received clipboard blobs.
+    #[must_use]
+    pub fn blob_directory(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.blob_directory = directory.into();
+        self
+    }
+
+    pub(crate) fn state_store(mut self, store: Arc<dyn StateStore>) -> Self {
+        self.store = store;
+        self
     }
 
     /// Uses an existing Iroh identity instead of generating a new one.
     #[must_use]
     pub fn secret_key(mut self, secret_key: SecretKey) -> Self {
-        self.identity = Some(secret_key);
+        self.endpoint = self.endpoint.secret_key(secret_key);
         self
     }
 
-    /// Uses persistent or test storage for identity and trusted peer records.
-    /// Without this option, the builder uses isolated ephemeral storage.
-    #[must_use]
-    pub fn store(mut self, store: Arc<dyn DeviceStore>) -> Self {
-        self.store = Some(store);
-        self
-    }
-
-    /// Disables relays and built-in address lookups.
+    /// Disables relay transport while preserving configured address lookups.
     ///
     /// This is useful for local tests and fully platform-provided networking.
     #[must_use]
     pub fn local_only(mut self) -> Self {
-        self.endpoint = self
-            .endpoint
-            .clear_address_lookup()
-            .relay_mode(RelayMode::Disabled);
+        self.endpoint = self.endpoint.relay_mode(RelayMode::Disabled);
         self
     }
 
@@ -79,50 +89,17 @@ impl MistBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Bind`] when Iroh cannot bind the configured
+    /// Returns [`MistError::Bind`] when Iroh cannot bind the configured
     /// endpoint.
-    pub async fn bind(self) -> Result<Arc<MistRuntime>, RuntimeError> {
-        executor::run(async move {
-            let storage_error = |error: crate::DeviceError| RuntimeError::Storage {
-                reason: error.to_string(),
-            };
-            let store = if let Some(store) = self.store {
-                store
-            } else {
-                let identity = if let Some(identity) = &self.identity {
-                    identity.clone()
-                } else {
-                    let mut bytes = [0; 32];
-                    getrandom::fill(&mut bytes).map_err(|error| RuntimeError::Storage {
-                        reason: format!("generate identity: {error}"),
-                    })?;
-                    SecretKey::from_bytes(&bytes)
-                };
-                Arc::new(MemoryStore::new(identity)) as Arc<dyn DeviceStore>
-            };
-            let identity = store.identity().map_err(storage_error)?;
-            store.peers().map_err(storage_error)?;
-            if let Some(explicit) = self.identity
-                && explicit.public() != identity.public()
-            {
-                return Err(RuntimeError::Storage {
-                    reason: "explicit key differs from stored identity".to_owned(),
-                });
-            }
-            let endpoint = self
-                .endpoint
-                .secret_key(identity)
-                .bind()
-                .await
-                .map_err(|error| RuntimeError::Bind {
-                    reason: error.to_string(),
-                })?;
-            Ok(MistRuntime::from_endpoint(
-                endpoint,
-                self.device_info,
-                store,
-            ))
-        })
-        .await?
+    pub async fn bind(self) -> Result<Arc<MistRuntime>, MistError> {
+        let endpoint = self.endpoint.bind().await?;
+        MistRuntime::from_endpoint(
+            endpoint,
+            self.device_info,
+            self.store,
+            self.local_addresses,
+            self.blob_directory,
+        )
+        .map_err(MistError::from)
     }
 }

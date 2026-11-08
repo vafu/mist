@@ -1,21 +1,30 @@
 //! Shared native runtime for Mist.
 //!
-//! [`MistRuntime`] is the root of one running Mist instance. It owns the Iroh
-//! endpoint, peer connections, and feature services such as
-//! [`Pairing`]. The same runtime is exposed to mobile hosts through `UniFFI`.
+//! The app-facing API is defined by `mist-app-contract`. This crate owns its
+//! Iroh, persistence, protocol, and executor implementations and exposes only a
+//! narrow host construction seam.
 
+mod clipboard;
 mod device;
+mod notification;
 mod pairing;
 mod protocol;
 mod runtime;
+mod storage;
+mod transfer;
 
-pub use device::{
-    DeviceError, DeviceInfo, DeviceStore, Devices, FileStore, MemoryStore, Peer, Platform,
+pub mod host;
+#[cfg(feature = "probe")]
+pub mod probe;
+
+pub(crate) use mist_app_contract::{
+    Clipboard, ClipboardContent, ClipboardError, ConnectionTransport, DeviceClass, DeviceError,
+    DeviceEvent, DeviceEventKind, DeviceInfo, DeviceManager, DeviceStatus, ManagedDevice, MistApp,
+    Notification, NotificationChannel, NotificationError, NotificationKind, Pairing, Platform,
+    ReceivedClipboard, ReceivedNotification,
 };
-pub use pairing::{Pairing, PairingError, PairingOffer};
-pub use runtime::{MistBuilder, MistRuntime, Runtime, RuntimeError, create_mist_runtime};
 
 /// Iroh application protocol negotiated by every Mist connection.
-pub const MIST_ALPN: &[u8] = b"mist/1";
+pub(crate) const MIST_ALPN: &[u8] = b"mist/1";
 
 uniffi::setup_scaffolding!();

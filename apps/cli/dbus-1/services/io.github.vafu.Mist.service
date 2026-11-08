@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.vafu.Mist
+Exec=mistd
+SystemdService=mistd.service

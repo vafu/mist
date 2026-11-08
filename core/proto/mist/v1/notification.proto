@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package mist.v1;
+
+// A platform notification transported between paired Mist devices.
+message Notification {
+  // Stable identifier assigned by the originating platform.
+  string id = 1;
+  string application = 2;
+  string title = 3;
+  string body = 4;
+  int64 timestamp_ms = 5;
+  bool silent = 6;
+  NotificationKind kind = 7;
+}
+
+// Platform classification of a notification. Values are wire-stable.
+enum NotificationKind {
+  NOTIFICATION_KIND_UNSPECIFIED = 0;
+  NOTIFICATION_KIND_MESSAGE = 1;
+  NOTIFICATION_KIND_MEDIA = 2;
+  NOTIFICATION_KIND_OTHER = 3;
+}

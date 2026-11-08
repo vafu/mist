@@ -1,14 +1,12 @@
 use std::env;
 use std::error::Error;
 use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use iroh::EndpointId;
-use iroh::endpoint::Connection;
-use mist_core::{DeviceInfo, FileStore, MistBuilder, MistRuntime, Platform, Runtime};
+use futures_util::StreamExt;
+use mist_linux::{DeviceRow, MistProxy};
 use qrcode::QrCode;
 use qrcode::render::unicode;
+use zbus::Connection;
 
 #[tokio::main]
 async fn main() {
@@ -19,109 +17,51 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
+    let connection = Connection::session().await?;
+    let mist = MistProxy::new(&connection).await?;
     let mut arguments = env::args().skip(1);
-    let command = arguments.next();
-    if matches!(command.as_deref(), Some("devices" | "device" | "forget")) {
-        let command = command.as_deref().unwrap();
-        let id = arguments.next();
-        if arguments.next().is_some()
-            || (command == "devices" && id.is_some())
-            || (command != "devices" && id.is_none())
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "use devices, device <endpoint-id>, or forget <endpoint-id>",
-            )
-            .into());
-        }
-        let runtime = bind_runtime().await?;
-        let result: Result<(), Box<dyn Error>> = (|| {
-            let devices = runtime.devices();
-            if command == "forget" {
-                devices.forget(id.unwrap())?;
-                println!("device forgotten");
-            } else {
-                let peers = devices.peers()?;
-                if let Some(id) = id {
-                    let peer = peers
-                        .into_iter()
-                        .find(|peer| peer.endpoint_id == id)
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::NotFound, "device is not saved")
-                        })?;
-                    println!(
-                        "{}\n{}\n{:?}",
-                        peer.device.display_name, peer.endpoint_id, peer.device.platform
-                    );
-                } else {
-                    for peer in peers {
-                        println!(
-                            "{}\t{}\t{:?}",
-                            peer.endpoint_id, peer.device.display_name, peer.device.platform
-                        );
-                    }
-                }
-            }
-            Ok(())
-        })();
-        runtime.shutdown().await?;
-        return result;
+    match arguments.next().as_deref() {
+        Some("status") if arguments.next().is_none() => status(&mist).await?,
+        Some("devices") if arguments.next().is_none() => devices(&mist).await?,
+        Some("pair") if arguments.next().is_none() => pair(&mist).await?,
+        Some("pair-cancel") if arguments.next().is_none() => mist.cancel_pairing().await?,
+        Some("select") => select(&mist, arguments, true).await?,
+        Some("unselect") => select(&mist, arguments, false).await?,
+        Some("connect") => device_command(&mist, arguments, true).await?,
+        Some("disconnect") => device_command(&mist, arguments, false).await?,
+        Some("forget") => forget(&mist, arguments).await?,
+        Some("notify") => notify(&mist, arguments).await?,
+        Some("clipboard") => clipboard(&mist, arguments).await?,
+        Some("clipboard-file") => clipboard_file(&mist, arguments).await?,
+        Some("watch") if arguments.next().is_none() => watch(&mist).await?,
+        Some("shutdown") if arguments.next().is_none() => mist.shutdown().await?,
+        _ => print_usage(),
     }
-    let (bound, connection) = match command.as_deref() {
-        Some("pair") => {
-            if arguments.next().is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "pair does not accept arguments",
-                )
-                .into());
-            }
-            initiate_pairing().await?
-        }
-        Some("listen") if arguments.next().is_none() => listen().await?,
-        Some("connect") => {
-            let peer = arguments.next().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "connect requires an endpoint ID",
-                )
-            })?;
-            if arguments.next().is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "connect accepts exactly one endpoint ID",
-                )
-                .into());
-            }
-            connect(peer.parse()?).await?
-        }
-        _ => {
-            print_usage();
-            return Ok(());
-        }
-    };
-
-    if let Some(connection) = &connection {
-        println!("connected to {}", connection.remote_id());
-    }
-    println!("press Ctrl-C to stop");
-
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        reason = async { match &connection { Some(connection) => connection.closed().await, None => std::future::pending().await } } => {
-            println!("connection closed: {reason}");
-        }
-    }
-    bound.shutdown().await?;
     Ok(())
 }
 
-async fn initiate_pairing()
--> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
-    let runtime = bind_runtime().await?;
-    let pairing = runtime.pairing();
-    let offer = pairing.initiate()?;
-    match QrCode::new(offer.encoded.as_bytes()) {
+async fn status(proxy: &MistProxy<'_>) -> zbus::Result<()> {
+    println!("endpoint: {}", proxy.endpoint_id().await?);
+    println!("connected: {}", proxy.connected().await?);
+    println!("devices: {}", proxy.devices().await?.len());
+    Ok(())
+}
+
+async fn devices(proxy: &MistProxy<'_>) -> zbus::Result<()> {
+    let devices = proxy.devices().await?;
+    if devices.is_empty() {
+        println!("No paired devices");
+        return Ok(());
+    }
+    for device in devices {
+        print_device(&device);
+    }
+    Ok(())
+}
+
+async fn pair(proxy: &MistProxy<'_>) -> Result<(), Box<dyn Error>> {
+    let offer = proxy.start_pairing().await?;
+    match QrCode::new(offer.as_bytes()) {
         Ok(code) => {
             let image = code
                 .render::<unicode::Dense1x2>()
@@ -132,74 +72,152 @@ async fn initiate_pairing()
         }
         Err(error) => eprintln!("could not render pairing QR code: {error}"),
     }
-    println!("pairing offer: {}", offer.encoded);
-    println!("waiting for the other device");
-    let peer = pairing.wait_for_peer().await?;
+    println!("pairing offer: {offer}");
+    println!("mistd is waiting for the peer in the background");
+    Ok(())
+}
+
+async fn select(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+    selected: bool,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint_id = one_argument(&mut arguments, "device endpoint ID")?;
+    proxy.select_device(&endpoint_id, selected).await?;
+    Ok(())
+}
+
+async fn device_command(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+    connect: bool,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint_id = one_argument(&mut arguments, "device endpoint ID")?;
+    if connect {
+        proxy.connect_device(&endpoint_id).await?;
+    } else {
+        proxy.disconnect_device(&endpoint_id).await?;
+    }
+    Ok(())
+}
+
+async fn forget(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint_id = one_argument(&mut arguments, "device endpoint ID")?;
+    proxy.forget_device(&endpoint_id).await?;
+    Ok(())
+}
+
+async fn notify(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let title = arguments
+        .next()
+        .ok_or_else(|| invalid_input("notify requires a title"))?;
+    let body = arguments.collect::<Vec<_>>().join(" ");
+    proxy.push_notification(&title, &body).await?;
+    Ok(())
+}
+
+async fn clipboard(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let text = arguments
+        .next()
+        .ok_or_else(|| invalid_input("clipboard requires text"))?;
+    proxy.push_clipboard_text(&text).await?;
+    Ok(())
+}
+
+async fn clipboard_file(
+    proxy: &MistProxy<'_>,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let path = arguments
+        .next()
+        .ok_or_else(|| invalid_input("clipboard-file requires a path"))?;
+    let mime_type = arguments
+        .next()
+        .unwrap_or_else(|| "application/octet-stream".to_owned());
+    proxy.push_clipboard_blob(&path, &mime_type).await?;
+    Ok(())
+}
+
+async fn watch(proxy: &MistProxy<'_>) -> zbus::Result<()> {
+    let mut device_changes = proxy.receive_device_changed().await?;
+    let mut notifications = proxy.receive_notification_received().await?;
+    let mut pairing_failures = proxy.receive_pairing_failed().await?;
+    let mut clipboard = proxy.receive_clipboard_received().await?;
+    loop {
+        tokio::select! {
+            Some(signal) = device_changes.next() => {
+                let args = signal.args()?;
+                println!("device changed: {}", args.endpoint_id());
+            }
+            Some(signal) = notifications.next() => {
+                let args = signal.args()?;
+                println!("notification from {}: {} — {}", args.endpoint_id(), args.title(), args.body());
+            }
+            Some(signal) = clipboard.next() => {
+                let args = signal.args()?;
+                if args.mime_type().starts_with("text/") {
+                    println!("clipboard from {}: {}", args.endpoint_id(), args.text());
+                } else {
+                    println!(
+                        "clipboard from {}: {} ({})",
+                        args.endpoint_id(),
+                        args.mime_type(),
+                        args.path(),
+                    );
+                }
+            }
+            Some(signal) = pairing_failures.next() => {
+                let args = signal.args()?;
+                eprintln!("pairing failed: {}", args.reason());
+            }
+            else => return Ok(()),
+        }
+    }
+}
+
+fn print_device(device: &DeviceRow) {
+    let (endpoint_id, name, class, platform, status, transport, selected) = device;
     println!(
-        "paired with {} ({})",
-        peer.device.display_name, peer.endpoint_id
+        "{name}\n  id: {endpoint_id}\n  {class}/{platform} · {status} via {transport} · selected={selected}"
     );
-    let connection = runtime
-        .connection(peer.endpoint_id.parse()?)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "paired peer disconnected"))?;
-    Ok((runtime, Some(connection)))
 }
 
-async fn listen() -> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
-    let runtime = bind_runtime().await?;
-    println!("endpoint: {}", runtime.endpoint_id());
-    println!("waiting for peer");
-    Ok((runtime, None))
+fn one_argument(
+    arguments: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> Result<String, io::Error> {
+    let value = arguments
+        .next()
+        .ok_or_else(|| invalid_input(format!("missing {name}")))?;
+    if arguments.next().is_some() {
+        return Err(invalid_input("too many arguments"));
+    }
+    Ok(value)
 }
 
-async fn connect(
-    peer: EndpointId,
-) -> Result<(std::sync::Arc<MistRuntime>, Option<Connection>), Box<dyn Error>> {
-    let runtime = bind_runtime().await?;
-    println!("endpoint: {}", runtime.endpoint_id());
-    let connection = runtime.connect(peer.into()).await?;
-    Ok((runtime, Some(connection)))
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  mist pair");
-    eprintln!("  mist listen");
-    eprintln!("  mist connect <endpoint-id>");
+    eprintln!("  mist status");
     eprintln!("  mist devices");
-    eprintln!("  mist device <endpoint-id>");
-    eprintln!("  mist forget <endpoint-id>");
-}
-
-async fn bind_runtime() -> Result<Arc<MistRuntime>, Box<dyn Error>> {
-    let directory = if let Some(path) = env::var_os("MIST_STATE_DIR") {
-        PathBuf::from(path)
-    } else if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(path).join("mist")
-    } else {
-        PathBuf::from(env::var_os("HOME").ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "HOME or MIST_STATE_DIR must be set",
-            )
-        })?)
-        .join(".local/state/mist")
-    };
-    let store = Arc::new(FileStore::open(directory)?);
-    Ok(MistBuilder::new(local_device_info())
-        .store(store)
-        .bind()
-        .await?)
-}
-
-fn local_device_info() -> DeviceInfo {
-    let display_name = env::var("HOSTNAME")
-        .or_else(|_| env::var("COMPUTERNAME"))
-        .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "Mist CLI".to_owned());
-    DeviceInfo {
-        display_name,
-        platform: Platform::Linux,
-    }
+    eprintln!("  mist pair | pair-cancel");
+    eprintln!("  mist select|unselect <endpoint-id>");
+    eprintln!("  mist connect|disconnect|forget <endpoint-id>");
+    eprintln!("  mist notify <title> [body]");
+    eprintln!("  mist clipboard <text>");
+    eprintln!("  mist clipboard-file <path> [mime-type]");
+    eprintln!("  mist watch");
+    eprintln!("  mist shutdown");
 }

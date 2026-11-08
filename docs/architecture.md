@@ -1,112 +1,117 @@
 # Architecture
 
-Mist has one shared Rust core for Linux and Android. Apps supply host inputs and
-present core results; they do not own pairing, trust, connection or storage rules.
-Iroh is the networking foundation.
+Mist is a native Rust application with platform bindings around one shared
+core. Iroh is the networking foundation, not an interchangeable adapter.
 
-## Workspace
-
-```text
-core/                 Shared runtime, device storage, pairing and protocol
-core/proto/           Private versioned Protobuf wire schemas
-apps/cli/             Rust command-line adapter
-apps/mobile/          Shared Compose UI and generated UniFFI/Gobley bindings
-apps/mobile/android/  Android launcher, private state path and native packaging
-```
-
-## Contracts and ownership
-
-Core behavioral components have trait contracts. Module roots define contracts,
-domain values, errors and intentional reexports; sibling files implement them.
+## Dependency boundaries
 
 ```text
-MistRuntime implements Runtime
-├── one local Iroh endpoint
-├── Arc<dyn Connections> → active connections keyed by remote endpoint ID
-├── Arc<dyn Pairing> → invitation state and authorization
-├── Arc<dyn Devices> → saved-device operations
-└── instance cancellation and tracked tasks on core-owned execution
-
-DeviceStore
-├── local Iroh identity
-└── saved Peer records (endpoint ID, display name, platform)
+apps/cli ───────────────┐
+apps/mobile service ────┼── mist-app-contract
+                        │          ▲
+                        └── mist-core (private runtime implementation)
+                                   ├── Iroh endpoint and sessions
+                                   ├── SQLite state store
+                                   └── protobuf wire protocol
 ```
 
-There is no mixed local-state/single-peer `Session`. Pairing receives local
-metadata explicitly and depends on the connection contract. No executor getter,
-device snapshot/subscription layer, duplicate trusted-device record, or separate
-mobile domain API is needed.
+`core/app-contract` is the complete app-facing API. It contains only
+platform-neutral records, errors, and traits: `MistApp`, `DeviceManager`,
+`Pairing`, `NotificationChannel`, and their reactive event streams. It does not
+depend on Iroh, Tokio, SQLite, prost, zbus, or Android.
 
-## Connections and pairing
+`core` implements the contract. Its concrete runtime, device registry,
+connections, storage traits, address lookup, executor, and protobuf types are
+private. Hosts enter through `mist_core::host::MistFactory`, configure optional
+Iroh custom transports/address lookups before bind, and then retain only
+`Arc<dyn MistApp>`. Raw addresses are never exposed through the app contract.
 
-Either peer may initiate, and an instance can connect to multiple peers at once.
-One core accept loop reads the initial control message and dispatches it to
-pairing authorization or trusted reconnect. `Pairing::wait_for_peer` waits for
-the invitation's result; it does not accept endpoint connections itself.
+UniFFI/Gobley generates two Kotlin namespaces from the linked native library:
+`io.github.vafu.mist.core` for the app contract and
+`io.github.vafu.mist.host` for the small construction seam. This keeps generated
+runtime support symbols separate while allowing `createMistApp` to return the
+generated contract object.
+
+## Identity and persistence
+
+Every production host supplies an app-private state directory. Rust owns a
+SQLite database there and persists:
+
+- the 32-byte Iroh secret key that defines the local endpoint identity;
+- trusted endpoint IDs and authenticated device metadata;
+- each device's user-controlled selected state;
+- transport addresses with their provenance.
+
+Live connection state and the currently selected transport are reconstructed
+and never stored. Existing malformed identity or device data fails startup;
+Mist never silently replaces a corrupt identity.
+
+The stored address lookup implements Iroh's native `AddressLookup`. Address
+records use add/remove operations and retain provenance (`pairing_offer` or
+`authenticated_peer`). Pairing tickets bootstrap the first connection, while
+authenticated session hellos and subsequent address snapshots update future
+reachability. Iroh publishes local address changes into a watch channel; Mist
+forwards those changes over the existing authenticated `mist/1` session. There
+is no address ALPN, polling loop, or refresh timer.
+
+## Pairing and sessions
 
 An invitation contains an Iroh endpoint ticket and a random single-use token.
-Invalid tokens do not consume it. Valid authorization consumes it before
-metadata exchange and persistence; later failure requires a new invitation.
-Creating another invitation or cancelling invalidates the previous invitation.
+The accepting peer proves possession before either side accepts device metadata,
+capabilities, or addresses. Iroh authenticates and encrypts the transport;
+Mist's token authorizes the previously unknown endpoint to enter the trusted
+device store.
 
-Iroh authenticates the remote endpoint identity. Mist's token authorizes a new
-peer. Pairing stores the peer locally before reporting success. There is no
-distributed storage transaction: a failure can leave one installation with trust
-that the other has not retained. A new invitation can repair that partial state.
+Each trusted device has independent metadata, selected state, connection state,
+generation, and Iroh connection. Replacing a connection increments its
+generation so an old close event cannot mark the replacement offline. Iroh can
+migrate a connection among direct IP, relay, and custom transports; path events
+update `ManagedDevice` reactively.
 
-Reconnect requires saved trust, checked again when registering the connection.
-Trust removal and connection registration are serialized so an in-flight
-reconnect using an old trust read cannot resurrect a forgotten peer. Forgetting
-closes that peer's connection and invalidates invitations; it does not promise
-to remove records on an offline remote installation.
+`DeviceManager` exposes only user decisions: list/get, subscribe, select,
+connect, disconnect, and forget. Forget closes any live connection and removes
+trust, metadata, and addresses through SQLite foreign-key cleanup.
 
-Simultaneous reconnects use a deterministic rank derived from the connection's
-TLS exporter, which produces the same bytes at both ends. Both peers retain the
-same winner and close duplicates. Re-pairing refreshes a record without replacing
-a working connection. Closed transports are not reported as connected and can
-be replaced without disturbing other peers.
+## Application processes
 
-## Identity and storage
+Linux uses a native daemon and a thin D-Bus client:
 
-`DeviceStore` is the persistence contract. `FileStore` is shared Rust code used
-on Linux and Android. It stores the local key and peer records in an installation
-directory, holds an exclusive OS writer lock, and uses atomic replacement plus
-file/directory synchronization for updates. Corrupt/unreadable state is an error,
-not an instruction to regenerate identity or discard trusted peers.
+```text
+mist CLI ── io.github.vafu.Mist1 ── mistd ── MistApp ── Iroh peers
+                                      │
+                                      └── org.freedesktop.Notifications
+```
 
-`MistBuilder::store` supplies persistent or test storage. Without it, the builder
-uses an isolated `MemoryStore` for ephemeral/testing use. An explicitly supplied
-key must match the store's identity. The exported default constructor takes local
-metadata and a storage directory and uses the same builder and file store.
+`mistd` stores data under `$XDG_STATE_HOME/mist` (or
+`$HOME/.local/state/mist`), publishes device/connection properties and signals,
+monitors freedesktop notifications, and displays remote notifications through
+the standard notification service.
 
-## Execution and lifecycle
+Android deliberately has two application processes:
 
-Construction and async operations run on a core-owned Tokio runtime. They work
-without a host Tokio reactor and survive a caller runtime being dropped. There
-is one public runtime error contract for Rust and generated calls.
+```text
+main process                         :mist process
+MainActivity/Compose                MistRuntimeService (foreground)
+       │                                  ├── Rust MistApp owner
+       └── AndroidMistController ─Binder──├── notification receive loop
+                                          └── NotificationListenerService
+```
 
-Shutdown rejects new work, invalidates invitations, cancels and waits for
-instance-owned tasks, and closes every peer connection and the endpoint. Repeated
-shutdown is safe and does not stop other instances. Dropping the last handle
-also starts cleanup, including when construction finishes after its caller has
-cancelled. Explicit async shutdown provides completion/error reporting.
-
-## Wire and generated bindings
-
-`prost` generates private wire types from `core/proto`. These are converted to
-domain values and do not cross public Rust or generated API boundaries. Control
-frames have a 64 KiB Protobuf payload limit excluding the length prefix.
-
-UniFFI metadata and Gobley 0.3.7 generate Kotlin declarations and implementations
-over the same Rust-owned objects. The shared UI queries saved peers and invokes
-pairing, reconnect and forget. The Android launcher supplies its private state
-directory. APK packaging contains the shared core; unused sibling iroh-kmp
-integration is not a build dependency.
+Native handles never cross Binder. The service translates contract values into
+`Bundle` snapshots and asynchronous result callbacks. The shared KMP UI depends
+only on `MistController`; a future iOS host can implement that same controller
+in-process while retaining the same Rust app contract. Closing or recreating an
+activity does not restart the endpoint.
 
 ## Growth rules
 
-- Follow YAGNI; add protocols, traits, records and dependencies for current needs.
-- Keep traits focused; do not create wrappers solely to preserve obsolete APIs.
-- Test core contracts and lifecycle first, with real Iroh for transport behavior.
-- Apps are UI/adapters and come after core correctness.
-- Automatic retry/discovery, D-Bus hosting and device features are separate work.
+- Feature protocol and state live in Rust.
+- App-visible types and operations start in `mist-app-contract` and are
+  generated for Kotlin.
+- Construction and Iroh host extensions stay in `mist-core::host`.
+- Every platform dependency entering the runtime uses a narrow trait.
+- Addresses and protobuf types stay private.
+- Production coordination is reactive: no sleeps, polling intervals, or
+  timer-driven synchronization.
+- Shared mobile UI lives in `apps/mobile`; Android lifecycle and Binder code
+  lives only in `apps/mobile/android`.

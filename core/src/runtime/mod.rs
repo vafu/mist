@@ -1,140 +1,846 @@
-//! Runtime contracts, construction, and domain errors.
+//! Native runtime ownership and construction.
 
+mod address_publisher;
 mod builder;
-mod connections;
-mod executor;
-mod service;
+pub(crate) mod executor;
+mod outbox;
+mod registry;
 
-pub(crate) use executor::run_owned;
-
-use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::{Mutex as StdMutex, PoisonError};
 
 use async_trait::async_trait;
-use iroh::endpoint::Connection;
-use iroh::{EndpointAddr, EndpointId};
+use futures_util::StreamExt;
+use iroh::endpoint::{
+    BindError, ConnectError, ConnectingError, Connection, RecvStream, SendStream,
+};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use thiserror::Error;
+use tokio::runtime::Handle;
+use tokio::sync::{Mutex, broadcast, mpsc};
 
-use crate::{DeviceError, Devices, Pairing, Peer};
-use tokio_util::sync::CancellationToken;
+use self::address_publisher::PublishedAddresses;
+use self::outbox::{Outbound, Outbox};
+use self::registry::DeviceRegistry;
+use crate::clipboard::IrohClipboard;
+use crate::device::RuntimeDeviceManager;
+use crate::notification::IrohNotificationChannel;
+use crate::pairing::IrohPairing;
+use crate::protocol::wire::{ControlFrame, PairingAuthenticate, control_frame};
+use crate::protocol::{
+    ClipboardMetadata, address_snapshot, decode_address_snapshot, decode_clipboard_item,
+    decode_notification, decode_session_hello, read_control_frame, session_hello,
+    write_control_frame,
+};
+use crate::storage::{AddressSource, StateStore, StoreError};
+use crate::transfer::{BlobMetadata, inspect_file, receive_blob};
+use crate::{
+    Clipboard, ClipboardContent, ClipboardError, DeviceError, DeviceInfo, DeviceManager, MIST_ALPN,
+    ManagedDevice, MistApp, Notification, NotificationChannel, NotificationError, NotificationKind,
+    Pairing, ReceivedClipboard, ReceivedNotification,
+};
 
-pub use builder::MistBuilder;
-pub use service::{MistRuntime, create_mist_runtime};
+pub(crate) use builder::MistBuilder;
 
-/// Behavior of one running Mist instance, shared by all hosts.
-///
-/// The runtime owns local networking resources; connections are addressed by
-/// remote endpoint identity. Scheduling is an implementation detail, never a
-/// dependency retrieved by a consumer. Concrete construction belongs to
-/// [`MistBuilder`].
-#[async_trait]
-pub trait Runtime: Send + Sync + Debug {
-    /// Returns the local endpoint address used to reach this instance.
-    fn address(&self) -> EndpointAddr;
-
-    /// Returns the pairing service for this instance.
-    fn pairing(&self) -> Arc<dyn Pairing>;
-
-    /// Returns saved-device operations over this same core instance.
-    fn devices(&self) -> Arc<dyn Devices>;
-
-    /// Looks up an active connection to a particular remote peer.
-    fn connection(&self, peer: EndpointId) -> Option<Connection>;
-
-    /// Reports whether at least one registered peer connection is open.
-    fn is_connected(&self) -> bool;
-
-    /// Opens a connection, exchanges the Mist hello, and registers the peer.
-    ///
-    /// # Errors
-    /// Returns a transport connection error or an endpoint shutdown error.
-    async fn connect(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
-
-    /// Resolves a saved peer by endpoint ID using configured Iroh address lookup.
-    ///
-    /// # Errors
-    /// Returns invalid identity, missing trust, transport, storage or closed errors.
-    async fn reconnect(&self, endpoint_id: String) -> Result<(), RuntimeError>;
-
-    /// Closes this instance's peer connections and endpoint.
-    ///
-    /// Shutdown must not stop an executor shared by other instances. This
-    /// rejects new work, invalidates invitations, and waits for instance-owned
-    /// operations to stop before returning. Repeated shutdown is harmless.
-    ///
-    /// # Errors
-    /// Returns an executor failure if shutdown could not complete.
-    async fn shutdown(&self) -> Result<(), RuntimeError>;
+/// Failure while constructing or connecting a Mist runtime.
+#[derive(Debug, Error)]
+pub(crate) enum MistError {
+    /// The local Iroh endpoint could not be bound.
+    #[error("failed to bind the Mist endpoint")]
+    Bind(#[from] BindError),
+    /// An outgoing connection could not be established.
+    #[error("failed to connect to the Mist peer")]
+    Connect(#[from] ConnectError),
+    /// An incoming connection failed during its handshake.
+    #[error("failed to accept the Mist peer")]
+    Accept(#[from] ConnectingError),
+    /// Persisted identity, trust, or address state could not be loaded.
+    #[error("Mist state storage failed")]
+    Storage(#[from] StoreError),
 }
 
-/// Transport operations needed by runtime ownership and pairing authorization.
-///
-/// Dialed/accepted candidates are not registered until their owner completes
-/// the required handshake. Metadata and execution handles do not belong here.
-/// Incoming acceptance ownership is internal to the core, not an app concern.
-#[async_trait]
-pub(crate) trait Connections: Send + Sync + Debug {
-    fn address(&self) -> EndpointAddr;
-    async fn dial(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
-    async fn connect(&self, peer: EndpointAddr) -> Result<Connection, RuntimeError>;
-    async fn run(self: Arc<Self>, pairing: Arc<dyn crate::pairing::IncomingPairing>);
-    /// Chooses the same live connection at both ends using TLS-exported rank.
-    fn register(&self, connection: Connection) -> Result<Connection, RuntimeError>;
-    fn trust(
+pub(crate) struct IncomingPairingAttempt {
+    pub(crate) connection: Connection,
+    pub(crate) send: SendStream,
+    pub(crate) recv: RecvStream,
+    pub(crate) token: [u8; 32],
+}
+
+impl std::fmt::Debug for IncomingPairingAttempt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncomingPairingAttempt")
+            .field("remote_id", &self.connection.remote_id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Session {
+    endpoint: Endpoint,
+    device_info: DeviceInfo,
+    devices: DeviceRegistry,
+    store: Arc<dyn StateStore>,
+    local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
+    address_revisions: StdMutex<std::collections::HashMap<(EndpointId, u64), u64>>,
+    notifications: broadcast::Sender<ReceivedNotification>,
+    clipboard: broadcast::Sender<ReceivedClipboard>,
+    blob_directory: std::path::PathBuf,
+    pairing_attempts_tx: mpsc::Sender<IncomingPairingAttempt>,
+    pairing_attempts_rx: Arc<Mutex<mpsc::Receiver<IncomingPairingAttempt>>>,
+    outbox: Outbox,
+    reconnecting: StdMutex<std::collections::HashSet<EndpointId>>,
+    executor: Handle,
+}
+
+impl Session {
+    fn new(
+        endpoint: Endpoint,
+        device_info: DeviceInfo,
+        store: Arc<dyn StateStore>,
+        local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
+        blob_directory: std::path::PathBuf,
+    ) -> Result<Arc<Self>, StoreError> {
+        let (notifications, _) = broadcast::channel(256);
+        let (clipboard, _) = broadcast::channel(64);
+        let (pairing_attempts_tx, pairing_attempts_rx) = mpsc::channel(32);
+        let devices = DeviceRegistry::new(store.load_devices()?);
+        Ok(Arc::new(Self {
+            endpoint,
+            device_info,
+            devices,
+            store,
+            local_addresses,
+            address_revisions: StdMutex::new(std::collections::HashMap::new()),
+            notifications,
+            clipboard,
+            blob_directory,
+            pairing_attempts_tx,
+            pairing_attempts_rx: Arc::new(Mutex::new(pairing_attempts_rx)),
+            outbox: Outbox::default(),
+            reconnecting: StdMutex::new(std::collections::HashSet::new()),
+            executor: Handle::current(),
+        }))
+    }
+
+    fn start(self: &Arc<Self>) {
+        let session = Arc::clone(self);
+        self.executor
+            .spawn(async move { session.accept_connections().await });
+    }
+
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    pub(crate) fn device_info(&self) -> &DeviceInfo {
+        &self.device_info
+    }
+
+    pub(crate) fn executor(&self) -> &Handle {
+        &self.executor
+    }
+
+    pub(crate) fn devices(&self) -> Vec<ManagedDevice> {
+        self.devices.devices()
+    }
+
+    pub(crate) fn device(&self, endpoint_id: EndpointId) -> Option<ManagedDevice> {
+        self.devices.device(endpoint_id)
+    }
+
+    pub(crate) fn subscribe_devices(&self) -> broadcast::Receiver<crate::DeviceEvent> {
+        self.devices.subscribe()
+    }
+
+    pub(crate) fn subscribe_notifications(&self) -> broadcast::Receiver<ReceivedNotification> {
+        self.notifications.subscribe()
+    }
+
+    pub(crate) fn subscribe_clipboard(&self) -> broadcast::Receiver<ReceivedClipboard> {
+        self.clipboard.subscribe()
+    }
+
+    pub(crate) async fn next_pairing_attempt(&self) -> Option<IncomingPairingAttempt> {
+        self.pairing_attempts_rx.lock().await.recv().await
+    }
+
+    pub(crate) async fn connect_candidate(
         &self,
-        peer: Peer,
+        peer: EndpointAddr,
+    ) -> Result<Connection, MistError> {
+        let expected_id = peer.id;
+        let connection = self.endpoint.connect(peer, MIST_ALPN).await?;
+        debug_assert_eq!(connection.remote_id(), expected_id);
+        Ok(connection)
+    }
+
+    pub(crate) fn install(
+        self: &Arc<Self>,
         connection: Connection,
-        cancelled: &CancellationToken,
-    ) -> Result<Connection, RuntimeError>;
-    fn forget(&self, peer: EndpointId) -> Result<(), DeviceError>;
-    fn get(&self, peer: EndpointId) -> Option<Connection>;
-    fn is_connected(&self) -> bool;
-    fn close(&self);
+        device: DeviceInfo,
+        addresses: &[iroh::TransportAddr],
+    ) -> Result<Connection, StoreError> {
+        let endpoint_id = connection.remote_id();
+        self.store.upsert_device(endpoint_id, &device, true)?;
+        self.sync_addresses(endpoint_id, AddressSource::AuthenticatedPeer, addresses)?;
+        let generation = self
+            .devices
+            .install(endpoint_id, device, connection.clone());
+        self.start_connection_worker(connection.clone(), generation);
+        self.start_address_publisher(connection.clone());
+        self.start_outbox_flush(connection.clone());
+        Ok(connection)
+    }
+
+    pub(crate) fn add_pairing_addresses(
+        &self,
+        endpoint_id: EndpointId,
+        addresses: &[iroh::TransportAddr],
+    ) -> Result<(), StoreError> {
+        self.store
+            .add_addresses(endpoint_id, AddressSource::PairingOffer, addresses)
+    }
+
+    fn sync_addresses(
+        &self,
+        endpoint_id: EndpointId,
+        source: AddressSource,
+        addresses: &[iroh::TransportAddr],
+    ) -> Result<(), StoreError> {
+        use std::collections::BTreeSet;
+
+        let previous = self
+            .store
+            .load_addresses_from(endpoint_id, source)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let current = addresses.iter().cloned().collect::<BTreeSet<_>>();
+        let added = current.difference(&previous).cloned().collect::<Vec<_>>();
+        let removed = previous.difference(&current).cloned().collect::<Vec<_>>();
+        self.store.add_addresses(endpoint_id, source, &added)?;
+        self.store.remove_addresses(endpoint_id, source, &removed)
+    }
+
+    fn start_address_publisher(self: &Arc<Self>, connection: Connection) {
+        let mut updates = self.local_addresses.clone();
+        self.executor.spawn(async move {
+            loop {
+                let update = updates.borrow_and_update().clone();
+                if let Some(update) = update {
+                    let Ok(mut stream) = connection.open_uni().await else {
+                        return;
+                    };
+                    let frame = ControlFrame {
+                        body: Some(control_frame::Body::AddressSnapshot(address_snapshot(
+                            update.revision,
+                            update.addresses,
+                        ))),
+                    };
+                    if write_control_frame(&mut stream, &frame).await.is_err()
+                        || stream.finish().is_err()
+                    {
+                        return;
+                    }
+                }
+                tokio::select! {
+                    _ = connection.closed() => return,
+                    changed = updates.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_connection_worker(self: &Arc<Self>, connection: Connection, generation: u64) {
+        let session = Arc::clone(self);
+        self.executor.spawn(async move {
+            let endpoint_id = connection.remote_id();
+            let mut path_events = connection.path_events();
+            loop {
+                tokio::select! {
+                    _ = connection.closed() => break,
+                    event = path_events.next() => {
+                        if event.is_none() {
+                            break;
+                        }
+                        session.devices.notify_changed(endpoint_id, generation);
+                    }
+                    incoming = connection.accept_uni() => {
+                        let Ok(stream) = incoming else { break };
+                        let session = Arc::clone(&session);
+                        let executor = session.executor.clone();
+                        executor.spawn(async move {
+                            session.receive_feature_frame(endpoint_id, generation, stream).await;
+                        });
+                    }
+                }
+            }
+            session
+                .address_revisions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&(endpoint_id, generation));
+            session.devices.mark_disconnected(endpoint_id, generation);
+        });
+    }
+
+    async fn receive_feature_frame(
+        &self,
+        endpoint_id: EndpointId,
+        generation: u64,
+        mut stream: RecvStream,
+    ) {
+        let Ok(frame) = read_control_frame(&mut stream).await else {
+            return;
+        };
+        match frame.body {
+            Some(control_frame::Body::Notification(wire)) => {
+                let Ok(notification) = decode_notification(wire) else {
+                    return;
+                };
+                let Some(source_device) = self.devices.device_info(endpoint_id) else {
+                    return;
+                };
+                let _ = self.notifications.send(ReceivedNotification {
+                    source_endpoint_id: endpoint_id.to_string(),
+                    source_device,
+                    notification,
+                });
+            }
+            Some(control_frame::Body::ClipboardItem(wire)) => {
+                let Ok(metadata) = decode_clipboard_item(wire) else {
+                    return;
+                };
+                let Some(source_device) = self.devices.device_info(endpoint_id) else {
+                    return;
+                };
+                let (content, sha256) = match metadata {
+                    ClipboardMetadata::Text { text } => {
+                        let fingerprint = crate::runtime::outbox::text_fingerprint(&text);
+                        (ClipboardContent::Text { text }, fingerprint)
+                    }
+                    ClipboardMetadata::Blob {
+                        mime_type,
+                        size,
+                        sha256,
+                    } => {
+                        let metadata = BlobMetadata {
+                            mime_type,
+                            size,
+                            sha256,
+                        };
+                        let Ok(path) =
+                            receive_blob(&mut stream, &self.blob_directory, &metadata).await
+                        else {
+                            return;
+                        };
+                        (
+                            ClipboardContent::Blob {
+                                mime_type: metadata.mime_type,
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                            sha256,
+                        )
+                    }
+                };
+                self.outbox.remember_received(sha256);
+                let _ = self.clipboard.send(ReceivedClipboard {
+                    source_endpoint_id: endpoint_id.to_string(),
+                    source_device,
+                    content,
+                    sha256: hex(&sha256),
+                });
+            }
+            Some(control_frame::Body::AddressSnapshot(snapshot)) => {
+                if !self.accept_address_revision(endpoint_id, generation, snapshot.revision) {
+                    return;
+                }
+                let Ok(addresses) = decode_address_snapshot(snapshot) else {
+                    return;
+                };
+                let _ =
+                    self.sync_addresses(endpoint_id, AddressSource::AuthenticatedPeer, &addresses);
+            }
+            _ => {}
+        }
+    }
+
+    fn accept_address_revision(
+        &self,
+        endpoint_id: EndpointId,
+        generation: u64,
+        revision: u64,
+    ) -> bool {
+        let mut revisions = self
+            .address_revisions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let current = revisions.entry((endpoint_id, generation)).or_insert(0);
+        if revision <= *current {
+            false
+        } else {
+            *current = revision;
+            true
+        }
+    }
+
+    async fn accept_connections(self: Arc<Self>) {
+        while let Some(incoming) = self.endpoint.accept().await {
+            let session = Arc::clone(&self);
+            self.executor.spawn(async move {
+                let Ok(connection) = incoming.await else {
+                    return;
+                };
+                session.route_connection(connection).await;
+            });
+        }
+    }
+
+    async fn route_connection(self: Arc<Self>, connection: Connection) {
+        let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+            return;
+        };
+        let Ok(frame) = read_control_frame(&mut recv).await else {
+            return;
+        };
+        match frame.body {
+            Some(control_frame::Body::PairingAuthenticate(PairingAuthenticate {
+                pairing_token,
+            })) => {
+                let Ok(token) = pairing_token.as_slice().try_into() else {
+                    return;
+                };
+                let _ = self
+                    .pairing_attempts_tx
+                    .send(IncomingPairingAttempt {
+                        connection,
+                        send,
+                        recv,
+                        token,
+                    })
+                    .await;
+            }
+            Some(control_frame::Body::SessionHello(hello)) => {
+                let endpoint_id = connection.remote_id();
+                if !self.devices.contains(endpoint_id) {
+                    connection.close(2_u32.into(), b"unpaired endpoint");
+                    return;
+                }
+                let Ok(peer) = decode_session_hello(hello) else {
+                    return;
+                };
+                let response = ControlFrame {
+                    body: Some(control_frame::Body::SessionHello(session_hello(
+                        self.device_info(),
+                        self.endpoint.addr(),
+                    ))),
+                };
+                if write_control_frame(&mut send, &response).await.is_err() {
+                    return;
+                }
+                if send.finish().is_err() {
+                    return;
+                }
+                let _ = self.install(connection, peer.device, &peer.addresses);
+            }
+            _ => connection.close(2_u32.into(), b"unexpected session handshake"),
+        }
+    }
+
+    pub(crate) async fn connect_device(
+        self: &Arc<Self>,
+        endpoint_id: EndpointId,
+    ) -> Result<(), DeviceError> {
+        let _known =
+            self.devices
+                .device_info(endpoint_id)
+                .ok_or_else(|| DeviceError::UnknownDevice {
+                    endpoint_id: endpoint_id.to_string(),
+                })?;
+        if self.devices.connection(endpoint_id).is_some() {
+            return Ok(());
+        }
+        self.devices.set_connecting(endpoint_id)?;
+        let result = async {
+            let connection = self
+                .endpoint
+                .connect(endpoint_id, MIST_ALPN)
+                .await
+                .map_err(|error| DeviceError::Connect {
+                    reason: error.to_string(),
+                })?;
+            let (mut send, mut recv) =
+                connection
+                    .open_bi()
+                    .await
+                    .map_err(|error| DeviceError::Protocol {
+                        reason: error.to_string(),
+                    })?;
+            write_control_frame(
+                &mut send,
+                &ControlFrame {
+                    body: Some(control_frame::Body::SessionHello(session_hello(
+                        self.device_info(),
+                        self.endpoint.addr(),
+                    ))),
+                },
+            )
+            .await
+            .map_err(|error| DeviceError::Protocol {
+                reason: error.to_string(),
+            })?;
+            let response =
+                read_control_frame(&mut recv)
+                    .await
+                    .map_err(|error| DeviceError::Protocol {
+                        reason: error.to_string(),
+                    })?;
+            let Some(control_frame::Body::SessionHello(hello)) = response.body else {
+                return Err(DeviceError::Protocol {
+                    reason: "peer did not return a session hello".to_owned(),
+                });
+            };
+            let peer = decode_session_hello(hello).map_err(|error| DeviceError::Protocol {
+                reason: error.to_string(),
+            })?;
+            send.finish().map_err(|error| DeviceError::Protocol {
+                reason: error.to_string(),
+            })?;
+            self.install(connection, peer.device, &peer.addresses)
+                .map_err(|error| DeviceError::Storage {
+                    reason: error.to_string(),
+                })?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.devices.clear_connecting(endpoint_id);
+        }
+        result
+    }
+
+    pub(crate) fn select_device(
+        &self,
+        endpoint_id: EndpointId,
+        selected: bool,
+    ) -> Result<(), DeviceError> {
+        if !self.devices.contains(endpoint_id) {
+            return Err(DeviceError::UnknownDevice {
+                endpoint_id: endpoint_id.to_string(),
+            });
+        }
+        self.store
+            .set_selected(endpoint_id, selected)
+            .map_err(|error| DeviceError::Storage {
+                reason: error.to_string(),
+            })?;
+        self.devices.select(endpoint_id, selected)
+    }
+
+    pub(crate) fn disconnect_device(&self, endpoint_id: EndpointId) -> Result<(), DeviceError> {
+        self.devices.disconnect(endpoint_id)
+    }
+
+    pub(crate) fn forget_device(&self, endpoint_id: EndpointId) -> Result<(), DeviceError> {
+        if !self.devices.contains(endpoint_id) {
+            return Err(DeviceError::UnknownDevice {
+                endpoint_id: endpoint_id.to_string(),
+            });
+        }
+        self.store
+            .forget_device(endpoint_id)
+            .map_err(|error| DeviceError::Storage {
+                reason: error.to_string(),
+            })?;
+        self.devices.forget(endpoint_id)
+    }
+
+    pub(crate) fn push_notification(
+        self: &Arc<Self>,
+        notification: &Notification,
+        targets: Vec<String>,
+    ) -> Result<(), NotificationError> {
+        // Media transport state belongs to the media feature; the generic
+        // notification bridge must not flood peers with track updates.
+        if notification.kind == NotificationKind::Media {
+            return Ok(());
+        }
+
+        let targets = self.resolve_targets(targets).map_err(|error| match error {
+            TargetError::Invalid(reason) => NotificationError::InvalidEndpointId { reason },
+            TargetError::Unknown(endpoint_id) => NotificationError::UnknownDevice { endpoint_id },
+            TargetError::NoSelected => NotificationError::NoSelectedDevices,
+        })?;
+
+        for endpoint_id in targets {
+            self.schedule(endpoint_id, Outbound::Notification(notification.clone()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn push_clipboard(
+        self: &Arc<Self>,
+        content: &ClipboardContent,
+        targets: Vec<String>,
+    ) -> Result<(), ClipboardError> {
+        let metadata = clipboard_blob_metadata(content)?;
+
+        let targets = self.resolve_targets(targets).map_err(|error| match error {
+            TargetError::Invalid(reason) => ClipboardError::InvalidEndpointId { reason },
+            TargetError::Unknown(endpoint_id) => ClipboardError::UnknownDevice { endpoint_id },
+            TargetError::NoSelected => ClipboardError::NoSelectedDevices,
+        })?;
+
+        for endpoint_id in targets {
+            self.schedule(
+                endpoint_id,
+                Outbound::Clipboard {
+                    content: content.clone(),
+                    metadata: metadata.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolves explicit targets, or every selected device when none are given.
+    fn resolve_targets(&self, targets: Vec<String>) -> Result<Vec<EndpointId>, TargetError> {
+        if targets.is_empty() {
+            let selected = self
+                .devices
+                .selected_connections()
+                .into_iter()
+                .map(|(endpoint_id, _)| endpoint_id)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(TargetError::NoSelected);
+            }
+            return Ok(selected);
+        }
+
+        targets
+            .into_iter()
+            .map(|target| {
+                let endpoint_id = EndpointId::from_str(&target)
+                    .map_err(|error| TargetError::Invalid(error.to_string()))?;
+                if !self.devices.contains(endpoint_id) {
+                    return Err(TargetError::Unknown(target));
+                }
+                Ok(endpoint_id)
+            })
+            .collect()
+    }
+
+    /// Sends now when connected, otherwise queues and starts a reconnect.
+    ///
+    /// Content that arrived from a peer is suppressed here so it is not echoed
+    /// back; features never have to reason about this.
+    fn schedule(self: &Arc<Self>, endpoint_id: EndpointId, message: Outbound) -> bool {
+        if let Some(fingerprint) = message.fingerprint()
+            && self.outbox.suppress_echo(fingerprint)
+        {
+            return false;
+        }
+        let connection = self.devices.connection(endpoint_id);
+        self.outbox.push(endpoint_id, message);
+        match connection {
+            Some(connection) => self.start_outbox_flush(connection),
+            None => self.ensure_connected(endpoint_id),
+        }
+        true
+    }
+
+    /// Starts a reconnect unless one is already in flight.
+    fn ensure_connected(self: &Arc<Self>, endpoint_id: EndpointId) {
+        let inserted = self
+            .reconnecting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(endpoint_id);
+        if !inserted {
+            return;
+        }
+        let session = Arc::clone(self);
+        self.executor.spawn(async move {
+            let _ = session.connect_device(endpoint_id).await;
+            session
+                .reconnecting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&endpoint_id);
+        });
+    }
+
+    /// Drains the endpoint's outbox in order while the connection lives.
+    fn start_outbox_flush(self: &Arc<Self>, connection: Connection) {
+        let endpoint_id = connection.remote_id();
+        if !self.outbox.begin_flush(endpoint_id) {
+            return;
+        }
+        let session = Arc::clone(self);
+        self.executor.spawn(async move {
+            loop {
+                let Some(message) = session.outbox.pop(endpoint_id) else {
+                    break;
+                };
+                if let Err(reason) = outbox::send(&connection, &message).await {
+                    debug_assert!(!reason.is_empty());
+                    session.outbox.push_front(endpoint_id, message);
+                    break;
+                }
+            }
+            session.outbox.end_flush(endpoint_id);
+            if session.outbox.has_pending(endpoint_id) {
+                session.ensure_connected(endpoint_id);
+            }
+        });
+    }
+
+    async fn close(&self) {
+        self.devices.close_all();
+        self.endpoint.close().await;
+    }
 }
 
-/// Runtime failures shared by direct Rust calls and generated bindings.
-#[derive(Clone, Debug, Error, uniffi::Error)]
-pub enum RuntimeError {
-    /// Identity or trusted-peer storage failed.
-    #[error("device storage failed: {reason}")]
-    Storage {
-        /// Underlying storage diagnostic.
-        reason: String,
-    },
-    /// A connection requires a new pairing invitation.
-    #[error("peer is not trusted: {endpoint_id}")]
-    Untrusted {
-        /// Authenticated remote endpoint identity.
-        endpoint_id: String,
-    },
-    /// A peer did not complete the Mist control handshake.
-    #[error("Mist protocol failed: {reason}")]
-    Protocol {
-        /// Underlying handshake diagnostic.
-        reason: String,
-    },
-    /// The endpoint or instance has closed.
-    #[error("the Mist runtime closed")]
-    Closed,
-    /// An outgoing transport connection failed.
-    #[error("failed to connect: {reason}")]
-    Connect {
-        /// Underlying transport diagnostic.
-        reason: String,
-    },
-    /// Execution of a core operation failed.
-    #[error("failed to run the Mist native executor: {reason}")]
-    Executor {
-        /// Human-readable executor failure.
-        reason: String,
-    },
-    /// Iroh could not bind the local endpoint.
-    #[error("failed to bind the Mist runtime: {reason}")]
-    Bind {
-        /// Human-readable bind failure.
-        reason: String,
-    },
+/// Failure while resolving outbound message targets.
+#[derive(Debug)]
+enum TargetError {
+    Invalid(String),
+    Unknown(String),
+    NoSelected,
 }
 
-#[cfg(test)]
-mod test;
+fn clipboard_blob_metadata(
+    content: &ClipboardContent,
+) -> Result<Option<BlobMetadata>, ClipboardError> {
+    match content {
+        ClipboardContent::Text { text } => {
+            if text.is_empty() {
+                Err(ClipboardError::Empty)
+            } else {
+                Ok(None)
+            }
+        }
+        ClipboardContent::Blob { mime_type, path } => {
+            inspect_file(mime_type, std::path::Path::new(path))
+                .map(Some)
+                .map_err(|error| ClipboardError::Unreadable {
+                    reason: error.to_string(),
+                })
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+/// Root object for one running Mist instance.
+///
+/// The runtime owns one Iroh endpoint and a registry of independently managed
+/// paired devices. `UniFFI` exposes this exact Rust allocation to mobile hosts.
+#[derive(Debug)]
+pub(crate) struct MistRuntime {
+    session: Arc<Session>,
+    devices: Arc<dyn DeviceManager>,
+    pairing: Arc<dyn Pairing>,
+    notifications: Arc<dyn NotificationChannel>,
+    clipboard: Arc<dyn Clipboard>,
+}
+
+impl MistRuntime {
+    pub(crate) fn from_endpoint(
+        endpoint: Endpoint,
+        device_info: DeviceInfo,
+        store: Arc<dyn StateStore>,
+        local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
+        blob_directory: std::path::PathBuf,
+    ) -> Result<Arc<Self>, StoreError> {
+        let session = Session::new(
+            endpoint,
+            device_info,
+            store,
+            local_addresses,
+            blob_directory,
+        )?;
+        session.start();
+        let pairing = Arc::new(IrohPairing::new(Arc::clone(&session)));
+        let notifications = Arc::new(IrohNotificationChannel::new(Arc::clone(&session)));
+        let clipboard = Arc::new(IrohClipboard::new(Arc::clone(&session)));
+        let devices = Arc::new(RuntimeDeviceManager::new(Arc::clone(&session)));
+        Ok(Arc::new(Self {
+            session,
+            devices,
+            pairing,
+            notifications,
+            clipboard,
+        }))
+    }
+
+    /// Returns the Iroh endpoint owned by this runtime.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        self.session.endpoint()
+    }
+
+    /// Returns any active connection, primarily for low-level diagnostics.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> Option<Connection> {
+        self.session
+            .devices
+            .devices()
+            .into_iter()
+            .find_map(|device| {
+                EndpointId::from_str(&device.endpoint_id)
+                    .ok()
+                    .and_then(|id| self.session.devices.connection(id))
+            })
+    }
+}
+
+impl MistRuntime {
+    async fn shutdown_runtime(&self) {
+        let session = Arc::clone(&self.session);
+        let executor = session.executor().clone();
+        let _ = executor.spawn(async move { session.close().await }).await;
+    }
+}
+
+#[async_trait]
+impl MistApp for MistRuntime {
+    fn endpoint_id(&self) -> String {
+        self.session.endpoint.id().to_string()
+    }
+
+    fn device_manager(&self) -> Arc<dyn DeviceManager> {
+        Arc::clone(&self.devices)
+    }
+
+    fn pairing(&self) -> Arc<dyn Pairing> {
+        Arc::clone(&self.pairing)
+    }
+
+    fn notification_channel(&self) -> Arc<dyn NotificationChannel> {
+        Arc::clone(&self.notifications)
+    }
+
+    fn clipboard(&self) -> Arc<dyn Clipboard> {
+        Arc::clone(&self.clipboard)
+    }
+
+    async fn shutdown(&self) {
+        self.shutdown_runtime().await;
+    }
+}

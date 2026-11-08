@@ -1,0 +1,15 @@
+[package]
+name = "mist-app-contract"
+description = "Stable app-facing contract for Mist"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "=0.1.89"
+thiserror.workspace = true
+uniffi = "=0.29.4"
+
+[lints]
+workspace = true

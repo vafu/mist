@@ -6,6 +6,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         "proto/mist/v1/device.proto",
         "proto/mist/v1/pairing.proto",
         "proto/mist/v1/session.proto",
+        "proto/mist/v1/notification.proto",
+        "proto/mist/v1/clipboard.proto",
         "proto/mist/v1/control.proto",
     ];
 

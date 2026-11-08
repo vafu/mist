@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package mist.v1;
+
+// One clipboard payload. Text travels inline; binary content follows the
+// control frame on the same uni stream.
+message ClipboardItem {
+  string mime_type = 1;
+  oneof payload {
+    ClipboardText text = 2;
+    ClipboardBlob blob = 3;
+  }
+}
+
+message ClipboardText {
+  string text = 1;
+}
+
+message ClipboardBlob {
+  uint64 size = 1;
+  bytes sha256 = 2;
+}

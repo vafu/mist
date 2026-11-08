@@ -16,7 +16,9 @@ allprojects {
 
 val repositoryRoot = layout.projectDirectory.dir("../..")
 val coreDirectory = repositoryRoot.dir("core")
+val appContractDirectory = coreDirectory.dir("app-contract")
 val uniffiConfig = layout.projectDirectory.file("uniffi.toml")
+val appContractUniffiConfig = layout.projectDirectory.file("uniffi-app-contract.toml")
 val bindingsOutput = layout.buildDirectory.dir("generated/mist-uniffi")
 val bindgenRoot = layout.buildDirectory.dir("tools/gobley-uniffi-bindgen")
 val bindgen = bindgenRoot.map { it.file("bin/gobley-uniffi-bindgen") }
@@ -49,29 +51,37 @@ val buildMistHostLibrary by tasks.registering(Exec::class) {
         repositoryRoot.file("Cargo.lock"),
         coreDirectory.file("Cargo.toml"),
         coreDirectory.file("build.rs"),
+        appContractDirectory.file("Cargo.toml"),
         uniffiConfig,
+        appContractUniffiConfig,
     )
     inputs.dir(coreDirectory.dir("proto"))
     inputs.dir(coreDirectory.dir("src"))
+    inputs.dir(appContractDirectory.dir("src"))
     outputs.file(hostLibrary)
+}
+
+val cleanMistBindings by tasks.registering(Delete::class) {
+    delete(bindingsOutput)
 }
 
 val generateMistBindings by tasks.registering(Exec::class) {
     group = "uniffi"
     description = "Generates Kotlin Multiplatform bindings for Mist"
-    dependsOn(installGobleyBindgen, buildMistHostLibrary)
+    dependsOn(installGobleyBindgen, buildMistHostLibrary, cleanMistBindings)
     workingDir(repositoryRoot)
     commandLine(
         bindgen.get().asFile.absolutePath,
         "--library",
-        "--crate", "mist_core",
-        "--config", uniffiConfig.asFile.absolutePath,
+        "--crate-configs", "mist_core=${uniffiConfig.asFile.absolutePath}",
+        "--crate-configs", "mist_app_contract=${appContractUniffiConfig.asFile.absolutePath}",
         "--out-dir", bindingsOutput.get().asFile.absolutePath,
         hostLibrary.asFile.absolutePath,
     )
     inputs.file(bindgen)
     inputs.file(hostLibrary)
     inputs.file(uniffiConfig)
+    inputs.file(appContractUniffiConfig)
     outputs.dir(bindingsOutput)
 }
 
@@ -95,6 +105,7 @@ kotlin {
             kotlin.srcDir(bindingsOutput.map { it.dir("commonMain/kotlin") })
         }
         commonMain.dependencies {
+            api(libs.iroh.runtime)
             implementation(libs.compose.foundation)
             implementation(libs.compose.material3)
             implementation(libs.compose.runtime)

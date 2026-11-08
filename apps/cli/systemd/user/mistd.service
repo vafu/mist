@@ -1,0 +1,12 @@
+[Unit]
+Description=Mist device bridge
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=io.github.vafu.Mist
+ExecStart=mistd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
