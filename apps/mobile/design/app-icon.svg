@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#35302a"/>
+      <stop offset="1" stop-color="#181716"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="300" x2="0" y2="830" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f3e6c9"/>
+      <stop offset="1" stop-color="#c0a675"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+
+  <g fill="none" stroke="url(#ink)" stroke-linecap="round" stroke-linejoin="round">
+    <!-- arch -->
+    <path d="M176 700 C 236 420, 372 330, 512 330
+             C 652 330, 788 420, 848 700" stroke-width="38"/>
+
+    <!-- hangers -->
+    <path d="M276 596 L276 676" stroke-width="16"/>
+    <path d="M356 494 L356 676" stroke-width="16"/>
+    <path d="M436 420 L436 676" stroke-width="16"/>
+    <path d="M512 396 L512 676" stroke-width="16"/>
+    <path d="M588 420 L588 676" stroke-width="16"/>
+    <path d="M668 494 L668 676" stroke-width="16"/>
+    <path d="M748 596 L748 676" stroke-width="16"/>
+
+    <!-- deck -->
+    <path d="M176 700 L848 700" stroke-width="42"/>
+
+    <!-- approach ramps -->
+    <path d="M176 700 L110 786" stroke-width="30"/>
+    <path d="M848 700 L914 786" stroke-width="30"/>
+  </g>
+</svg>

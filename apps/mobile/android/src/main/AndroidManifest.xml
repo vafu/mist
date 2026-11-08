@@ -10,7 +10,9 @@
     <application
         android:name=".MistApplication"
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
         android:label="Mist"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"
