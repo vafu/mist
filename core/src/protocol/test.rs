@@ -61,6 +61,8 @@ fn notification_round_trips_between_domain_and_wire_types() {
         timestamp_ms: 1_791_015_507_000,
         silent: true,
         kind: NotificationKind::Message,
+        app_icon: None,
+        image: None,
     };
 
     let frame = ControlFrame {

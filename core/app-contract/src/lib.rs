@@ -25,7 +25,7 @@ pub use media::{
 };
 pub use notification::{
     Notification, NotificationChannel, NotificationError, NotificationEventStream,
-    NotificationKind, ReceivedNotification,
+    NotificationImage, NotificationKind, ReceivedNotification,
 };
 pub use pairing::{PairedPeer, Pairing, PairingError, PairingOffer};
 

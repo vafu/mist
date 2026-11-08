@@ -66,6 +66,8 @@ public class MistNotificationListenerService : NotificationListenerService() {
                         timestampMs = status.postTime,
                         silent = false,
                         kind = status.notificationKind(),
+                        appIcon = status.smallIconImage(this@MistNotificationListenerService),
+                        image = status.largeImage(this@MistNotificationListenerService),
                     ).toBundle(),
                 )
             }.onFailure { error ->

@@ -21,6 +21,16 @@ pub enum NotificationKind {
     Other,
 }
 
+/// An image attached to a notification.
+///
+/// `path` is an absolute path to a regular file the caller owns. Runtimes copy
+/// or stream it; the path never identifies a peer-address or network resource.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct NotificationImage {
+    pub mime_type: String,
+    pub path: String,
+}
+
 /// Platform-neutral notification exchanged between Mist devices.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct Notification {
@@ -31,6 +41,10 @@ pub struct Notification {
     pub timestamp_ms: i64,
     pub silent: bool,
     pub kind: NotificationKind,
+    /// Small application icon, typically 48-96 px.
+    pub app_icon: Option<NotificationImage>,
+    /// Larger content image such as a photo or album art.
+    pub image: Option<NotificationImage>,
 }
 
 /// Notification received from an authenticated peer.

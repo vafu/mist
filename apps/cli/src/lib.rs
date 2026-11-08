@@ -65,7 +65,10 @@ pub trait Mist {
     fn forget_device(&self, endpoint_id: &str) -> zbus::Result<()>;
 
     /// Sends a notification to selected devices.
-    fn push_notification(&self, title: &str, body: &str) -> zbus::Result<()>;
+    /// Sends a notification to selected devices.
+    ///
+    /// An empty `image_path` means no artwork.
+    fn push_notification(&self, title: &str, body: &str, image_path: &str) -> zbus::Result<()>;
 
     /// Current media players, local and remote.
     #[zbus(property)]

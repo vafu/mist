@@ -20,6 +20,7 @@ import io.github.vafu.mist.core.Media
 import io.github.vafu.mist.core.MediaCommandHandler
 import io.github.vafu.mist.core.MistApp
 import io.github.vafu.mist.core.Notification
+import io.github.vafu.mist.core.NotificationImage
 import io.github.vafu.mist.core.NotificationKind
 import io.github.vafu.mist.core.NotificationChannel as MistNotificationChannel
 import io.github.vafu.mist.core.Pairing
@@ -299,7 +300,7 @@ public class MistRuntimeService : Service() {
                 } else {
                     REMOTE_CHANNEL_ID
                 }
-                val notification = android.app.Notification.Builder(this, channelId)
+                val builder = android.app.Notification.Builder(this, channelId)
                     .setSmallIcon(android.R.drawable.ic_dialog_info)
                     .setContentTitle(received.notification.title)
                     .setContentText(received.notification.body)
@@ -307,7 +308,18 @@ public class MistRuntimeService : Service() {
                         "${received.notification.application} · ${received.sourceDevice.displayName}",
                     )
                     .setAutoCancel(true)
-                    .build()
+                val icon = received.notification.appIcon?.loadBitmap()
+                val image = received.notification.image?.loadBitmap()
+                if (icon != null) {
+                    builder.setLargeIcon(icon)
+                }
+                if (image != null) {
+                    builder.setLargeIcon(image)
+                    builder.setStyle(
+                        android.app.Notification.BigPictureStyle().bigPicture(image),
+                    )
+                }
+                val notification = builder.build()
                 runCatching {
                     getSystemService(NotificationManager::class.java).notify(
                         "${received.sourceEndpointId}:${received.notification.id}",
@@ -541,6 +553,10 @@ internal const val KEY_BODY: String = "body"
 internal const val KEY_TIMESTAMP_MS: String = "timestamp_ms"
 internal const val KEY_SILENT: String = "silent"
 internal const val KEY_NOTIFICATION_KIND: String = "notification_kind"
+internal const val KEY_APP_ICON: String = "notification_app_icon"
+internal const val KEY_IMAGE: String = "notification_image"
+internal const val KEY_IMAGE_MIME_TYPE: String = "image_mime_type"
+internal const val KEY_IMAGE_PATH: String = "image_path"
 internal const val KEY_CLIPBOARD_KIND: String = "clipboard_kind"
 internal const val KEY_CLIPBOARD_TEXT: String = "clipboard_text"
 internal const val KEY_CLIPBOARD_MIME_TYPE: String = "clipboard_mime_type"
@@ -582,7 +598,23 @@ internal fun Notification.toBundle(): Bundle = Bundle().apply {
     putLong(KEY_TIMESTAMP_MS, timestampMs)
     putBoolean(KEY_SILENT, silent)
     putString(KEY_NOTIFICATION_KIND, kind.name)
+    appIcon?.let { putBundle(KEY_APP_ICON, it.toBundle()) }
+    image?.let { putBundle(KEY_IMAGE, it.toBundle()) }
 }
+
+/** Decodes the image file into a bitmap for the notification, if readable. */
+internal fun NotificationImage.loadBitmap(): android.graphics.Bitmap? =
+    runCatching { android.graphics.BitmapFactory.decodeFile(path) }.getOrNull()
+
+internal fun NotificationImage.toBundle(): Bundle = Bundle().apply {
+    putString(KEY_IMAGE_MIME_TYPE, mimeType)
+    putString(KEY_IMAGE_PATH, path)
+}
+
+private fun Bundle.toNotificationImage(): NotificationImage = NotificationImage(
+    mimeType = getString(KEY_IMAGE_MIME_TYPE).orEmpty(),
+    path = getString(KEY_IMAGE_PATH).orEmpty(),
+)
 
 private fun Bundle.toMistNotification(): Notification = Notification(
     id = getString(KEY_ID).orEmpty(),
@@ -592,6 +624,8 @@ private fun Bundle.toMistNotification(): Notification = Notification(
     timestampMs = getLong(KEY_TIMESTAMP_MS),
     silent = getBoolean(KEY_SILENT),
     kind = NotificationKind.valueOf(getString(KEY_NOTIFICATION_KIND).orEmpty()),
+    appIcon = getBundle(KEY_APP_ICON)?.toNotificationImage(),
+    image = getBundle(KEY_IMAGE)?.toNotificationImage(),
 )
 
 internal fun ClipboardContent.toBundle(): Bundle = Bundle().apply {

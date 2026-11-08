@@ -16,7 +16,8 @@ use iroh::endpoint::Connection;
 
 use crate::protocol::wire::{ControlFrame, control_frame};
 use crate::protocol::{
-    encode_clipboard_blob, encode_clipboard_text, encode_notification, write_control_frame,
+    encode_clipboard_blob, encode_clipboard_text, encode_notification_with_images,
+    write_control_frame,
 };
 use crate::transfer::{BlobMetadata, send_blob};
 use crate::{ClipboardContent, Notification};
@@ -163,16 +164,28 @@ pub(crate) async fn send(connection: &Connection, message: &Outbound) -> Result<
         .map_err(|error| error.to_string())?;
     match message {
         Outbound::Notification(notification) => {
+            let encoded =
+                encode_notification_with_images(notification).map_err(|error| error.to_string())?;
             write_control_frame(
                 &mut stream,
                 &ControlFrame {
-                    body: Some(control_frame::Body::Notification(encode_notification(
-                        notification,
-                    ))),
+                    body: Some(control_frame::Body::Notification(encoded.frame)),
                 },
             )
             .await
             .map_err(|error| error.to_string())?;
+            let paths = [
+                notification
+                    .app_icon
+                    .as_ref()
+                    .map(|image| image.path.clone()),
+                notification.image.as_ref().map(|image| image.path.clone()),
+            ];
+            for (metadata, path) in encoded.images.iter().zip(paths.into_iter().flatten()) {
+                send_blob(&mut stream, std::path::Path::new(&path), metadata)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Outbound::Clipboard { content, metadata } => {
             let frame = match (content, metadata) {

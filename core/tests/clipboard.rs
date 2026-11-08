@@ -207,6 +207,8 @@ async fn notification_and_clipboard_streams_are_independent() {
                 timestamp_ms: 1,
                 silent: true,
                 kind: NotificationKind::Message,
+                app_icon: None,
+                image: None,
             },
             Vec::new(),
         )
@@ -293,6 +295,8 @@ async fn notification_sent_while_disconnected_is_delivered_after_reconnect() {
                 timestamp_ms: 2,
                 silent: true,
                 kind: NotificationKind::Message,
+                app_icon: None,
+                image: None,
             },
             vec![right_id],
         )
@@ -328,6 +332,8 @@ async fn media_notifications_are_not_forwarded_by_the_notification_bridge() {
                     timestamp_ms: 3,
                     silent: true,
                     kind,
+                    app_icon: None,
+                    image: None,
                 },
                 Vec::new(),
             )
@@ -348,6 +354,139 @@ async fn media_notifications_are_not_forwarded_by_the_notification_bridge() {
             .is_err(),
         "media notifications must not reach the generic notification stream"
     );
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_images_cross_the_wire() {
+    let (left_dir, _right_dir, left, right) = paired().await;
+    let incoming = right.notification_channel().subscribe();
+
+    let icon_bytes = (0_u32..5_000)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    let image_bytes = (0_u32..40_000)
+        .map(|index| u8::try_from(index % 249).unwrap())
+        .collect::<Vec<_>>();
+    let icon_path = left_dir.path().join("icon.png");
+    let image_path = left_dir.path().join("image.png");
+    std::fs::write(&icon_path, &icon_bytes).unwrap();
+    std::fs::write(&image_path, &image_bytes).unwrap();
+
+    left.notification_channel()
+        .push(
+            Notification {
+                id: "with-images".to_owned(),
+                application: "Mist tests".to_owned(),
+                title: "Rich".to_owned(),
+                body: "Has artwork".to_owned(),
+                timestamp_ms: 4,
+                silent: true,
+                kind: NotificationKind::Message,
+                app_icon: Some(mist_app_contract::NotificationImage {
+                    mime_type: "image/png".to_owned(),
+                    path: icon_path.to_string_lossy().into_owned(),
+                }),
+                image: Some(mist_app_contract::NotificationImage {
+                    mime_type: "image/png".to_owned(),
+                    path: image_path.to_string_lossy().into_owned(),
+                }),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(5), incoming.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let icon = received.notification.app_icon.expect("app icon");
+    let image = received.notification.image.expect("content image");
+    assert_eq!(std::fs::read(&icon.path).unwrap(), icon_bytes);
+    assert_eq!(std::fs::read(&image.path).unwrap(), image_bytes);
+    assert_eq!(icon.mime_type, "image/png");
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_notification_image_is_rejected() {
+    let (left_dir, _right_dir, left, right) = paired().await;
+    let incoming = right.notification_channel().subscribe();
+
+    let path = left_dir.path().join("huge.png");
+    std::fs::write(&path, vec![0_u8; 600 * 1024]).unwrap();
+
+    let result = left
+        .notification_channel()
+        .push(
+            Notification {
+                id: "too-big".to_owned(),
+                application: "Mist tests".to_owned(),
+                title: "Huge".to_owned(),
+                body: String::new(),
+                timestamp_ms: 5,
+                silent: true,
+                kind: NotificationKind::Message,
+                app_icon: Some(mist_app_contract::NotificationImage {
+                    mime_type: "image/png".to_owned(),
+                    path: path.to_string_lossy().into_owned(),
+                }),
+                image: None,
+            },
+            Vec::new(),
+        )
+        .await;
+    assert!(result.is_err(), "oversized icon must be rejected");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), incoming.next())
+            .await
+            .is_err()
+    );
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_image_path_is_populated_on_receive() {
+    let (left_dir, _right_dir, left, right) = paired().await;
+    let incoming = right.notification_channel().subscribe();
+    let path = left_dir.path().join("art.png");
+    std::fs::write(&path, vec![137_u8, 80, 78, 71]).unwrap();
+
+    left.notification_channel()
+        .push(
+            Notification {
+                id: "art".to_owned(),
+                application: "Mist".to_owned(),
+                title: "Art".to_owned(),
+                body: String::new(),
+                timestamp_ms: 6,
+                silent: true,
+                kind: NotificationKind::Message,
+                app_icon: None,
+                image: Some(mist_app_contract::NotificationImage {
+                    mime_type: "image/png".to_owned(),
+                    path: path.to_string_lossy().into_owned(),
+                }),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(5), incoming.next())
+        .await
+        .unwrap()
+        .unwrap();
+    let image = received.notification.image.expect("image present");
+    assert!(!image.path.is_empty(), "received path must be populated");
+    assert_eq!(image.mime_type, "image/png");
 
     left.shutdown().await;
     right.shutdown().await;

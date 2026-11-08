@@ -12,6 +12,16 @@ message Notification {
   int64 timestamp_ms = 5;
   bool silent = 6;
   NotificationKind kind = 7;
+  // Binary payloads follow the control frame on the same stream, in this order.
+  NotificationImage app_icon = 8;
+  NotificationImage image = 9;
+}
+
+// Metadata for one notification image; bytes follow the control frame.
+message NotificationImage {
+  string mime_type = 1;
+  uint64 size = 2;
+  bytes sha256 = 3;
 }
 
 // Platform classification of a notification. Values are wire-stable.

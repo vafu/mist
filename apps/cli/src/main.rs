@@ -117,8 +117,16 @@ async fn notify(
     let title = arguments
         .next()
         .ok_or_else(|| invalid_input("notify requires a title"))?;
-    let body = arguments.collect::<Vec<_>>().join(" ");
-    proxy.push_notification(&title, &body).await?;
+    let mut rest = arguments.collect::<Vec<_>>();
+    let mut image_path = String::new();
+    if let Some(index) = rest.iter().position(|argument| argument == "--image")
+        && index + 1 < rest.len()
+    {
+        image_path = rest.remove(index + 1);
+        rest.remove(index);
+    }
+    let body = rest.join(" ");
+    proxy.push_notification(&title, &body, &image_path).await?;
     Ok(())
 }
 

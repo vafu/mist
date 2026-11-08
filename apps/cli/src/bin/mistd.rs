@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use mist_app_contract::{
     ClipboardContent, ConnectionTransport, DeviceClass, DeviceInfo, DeviceStatus, ManagedDevice,
-    MediaCommand, MistApp, Notification, NotificationKind, Platform,
+    MediaCommand, MistApp, Notification, NotificationImage, NotificationKind, Platform,
 };
 use mist_core::host::MistFactory;
 use mist_linux::clipboard::{LocalClipboardProvider, WaylandClipboard};
@@ -185,7 +185,16 @@ impl MistDbus {
             .map_err(fdo_error)
     }
 
-    async fn push_notification(&self, title: &str, body: &str) -> zbus::fdo::Result<()> {
+    async fn push_notification(
+        &self,
+        title: &str,
+        body: &str,
+        image_path: &str,
+    ) -> zbus::fdo::Result<()> {
+        let image = (!image_path.is_empty()).then(|| NotificationImage {
+            mime_type: guess_image_mime(image_path),
+            path: image_path.to_owned(),
+        });
         self.runtime
             .notification_channel()
             .push(
@@ -197,6 +206,8 @@ impl MistDbus {
                     timestamp_ms: unix_millis(),
                     silent: false,
                     kind: NotificationKind::Message,
+                    app_icon: None,
+                    image,
                 },
                 Vec::new(),
             )
@@ -359,13 +370,96 @@ async fn forward_incoming_notifications(
     }
 }
 
+/// Resolves an `image-path` style hint (URI or file path) into a local image.
+fn hint_image(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<NotificationImage> {
+    let value = hints.get(key)?;
+    let raw = <&str>::try_from(value).ok()?;
+    let path = raw.strip_prefix("file://").unwrap_or(raw);
+    let path = PathBuf::from(percent_decode(path));
+    attach_image(&path, key.contains("icon"))
+}
+
+fn file_icon(app_icon: &str) -> Option<NotificationImage> {
+    if app_icon.is_empty() {
+        return None;
+    }
+    let path = app_icon.strip_prefix("file://").unwrap_or(app_icon);
+    attach_image(&PathBuf::from(percent_decode(path)), true)
+}
+
+fn attach_image(path: &std::path::Path, small: bool) -> Option<NotificationImage> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    };
+    if !path.is_file() {
+        return None;
+    }
+    let _ = small;
+    Some(NotificationImage {
+        mime_type: mime_type.to_owned(),
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
+fn guess_image_mime(path: &str) -> String {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg".to_owned(),
+        Some("webp") => "image/webp".to_owned(),
+        Some("gif") => "image/gif".to_owned(),
+        _ => "image/png".to_owned(),
+    }
+}
+
+fn percent_decode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or_default();
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte as char);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index] as char);
+        index += 1;
+    }
+    out
+}
+
 async fn show_desktop_notification(
     connection: &Connection,
     device_name: &str,
     notification: &Notification,
 ) -> zbus::Result<()> {
     let actions: Vec<&str> = Vec::new();
-    let hints: HashMap<&str, OwnedValue> = HashMap::new();
+    let mut hints: HashMap<&str, OwnedValue> = HashMap::new();
+    for path in [
+        notification.app_icon.as_ref().map(|icon| &icon.path),
+        notification.image.as_ref().map(|image| &image.path),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(value) =
+            OwnedValue::try_from(zbus::zvariant::Value::from(format!("file://{path}")))
+        {
+            hints.insert("image-path", value);
+        }
+    }
     connection
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -419,11 +513,16 @@ async fn monitor_desktop_notifications(
         {
             continue;
         }
-        let Ok((application, _, _, title, body, _, _, _)) =
+        let Ok((application, _, app_icon, title, body, _, hints, _)) =
             message.body().deserialize::<NotifyBody>()
         else {
             continue;
         };
+        let icon = hint_image(&hints, "image-path")
+            .or_else(|| hint_image(&hints, "image_path"))
+            .or_else(|| hint_image(&hints, "app_icon"))
+            .or_else(|| file_icon(&app_icon));
+        let image = hint_image(&hints, "image-data").or_else(|| hint_image(&hints, "image_data"));
         let notification = Notification {
             id: format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)),
             application,
@@ -432,6 +531,8 @@ async fn monitor_desktop_notifications(
             timestamp_ms: unix_millis(),
             silent: false,
             kind: NotificationKind::Message,
+            app_icon: icon,
+            image,
         };
         if let Err(error) = runtime
             .notification_channel()

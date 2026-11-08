@@ -31,9 +31,9 @@ use crate::pairing::IrohPairing;
 use crate::protocol::wire::{ControlFrame, PairingAuthenticate, control_frame};
 use crate::protocol::{
     ClipboardMetadata, address_snapshot, decode_address_snapshot, decode_clipboard_item,
-    decode_media_command, decode_media_snapshot, decode_notification, decode_session_hello,
-    encode_media_command, encode_media_snapshot, read_control_frame, session_hello,
-    write_control_frame,
+    decode_media_command, decode_media_snapshot, decode_notification_with_images,
+    decode_session_hello, encode_media_command, encode_media_snapshot, read_control_frame,
+    session_hello, write_control_frame,
 };
 use crate::storage::{AddressSource, StateStore, StoreError};
 use crate::transfer::{BlobMetadata, inspect_file, receive_blob};
@@ -484,9 +484,10 @@ impl Session {
         };
         match frame.body {
             Some(control_frame::Body::Notification(wire)) => {
-                let Ok(notification) = decode_notification(wire) else {
+                let Ok(decoded) = decode_notification_with_images(wire) else {
                     return;
                 };
+                let notification = self.receive_notification_images(&mut stream, decoded).await;
                 let Some(source_device) = self.devices.device_info(endpoint_id) else {
                     return;
                 };
@@ -558,6 +559,42 @@ impl Session {
             }
             _ => {}
         }
+    }
+
+    /// Streams notification artwork into app-private files.
+    async fn receive_notification_images(
+        &self,
+        stream: &mut RecvStream,
+        decoded: crate::protocol::DecodedNotification,
+    ) -> crate::Notification {
+        let crate::protocol::DecodedNotification {
+            mut notification,
+            images,
+        } = decoded;
+        let mut images = images.into_iter();
+        for target in [
+            notification
+                .app_icon
+                .is_some()
+                .then_some(&mut notification.app_icon),
+            notification
+                .image
+                .is_some()
+                .then_some(&mut notification.image),
+        ] {
+            let Some(slot) = target else {
+                continue;
+            };
+            let Some(metadata) = images.next() else {
+                continue;
+            };
+            if let Ok(path) = receive_blob(stream, &self.blob_directory, &metadata).await
+                && let Some(image) = slot.as_mut()
+            {
+                image.path = path.to_string_lossy().into_owned();
+            }
+        }
+        notification
     }
 
     fn receive_media_snapshot(
@@ -807,6 +844,12 @@ impl Session {
             TargetError::Invalid(reason) => NotificationError::InvalidEndpointId { reason },
             TargetError::Unknown(endpoint_id) => NotificationError::UnknownDevice { endpoint_id },
             TargetError::NoSelected => NotificationError::NoSelectedDevices,
+        })?;
+
+        crate::protocol::validate_notification_images(notification).map_err(|error| {
+            NotificationError::Transport {
+                reason: error.to_string(),
+            }
         })?;
 
         for endpoint_id in targets {

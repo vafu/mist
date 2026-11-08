@@ -59,6 +59,8 @@ pub(crate) enum ProtocolError {
     InvalidDisplayName,
     #[error("notification field {0} exceeds its protocol limit")]
     InvalidNotification(&'static str),
+    #[error("notification image is too large")]
+    NotificationImageTooLarge,
     #[error("session hello did not contain an address snapshot")]
     MissingAddresses,
     #[error("invalid transport address: {0}")]
@@ -262,6 +264,76 @@ fn decode_device(device: &wire::DeviceInfo) -> Result<DeviceInfo, ProtocolError>
     })
 }
 
+/// Decoded notification plus any images that follow on the stream.
+#[derive(Debug)]
+pub(crate) struct DecodedNotification {
+    pub(crate) notification: Notification,
+    /// Image metadata in stream order: app icon, then content image.
+    pub(crate) images: Vec<crate::transfer::BlobMetadata>,
+}
+
+/// Encoded notification frame plus the image metadata to stream after it.
+pub(crate) struct EncodedNotification {
+    pub(crate) frame: wire::Notification,
+    pub(crate) images: Vec<crate::transfer::BlobMetadata>,
+}
+
+pub(crate) const MAX_NOTIFICATION_ICON_BYTES: u64 = 512 * 1024;
+pub(crate) const MAX_NOTIFICATION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Encodes notification metadata and inspects attached images.
+///
+/// The caller writes the returned frame, then streams each image in order.
+pub(crate) fn encode_notification_with_images(
+    notification: &Notification,
+) -> Result<EncodedNotification, ProtocolError> {
+    let icon =
+        inspect_notification_image(notification.app_icon.as_ref(), MAX_NOTIFICATION_ICON_BYTES)?;
+    let image =
+        inspect_notification_image(notification.image.as_ref(), MAX_NOTIFICATION_IMAGE_BYTES)?;
+    let frame = wire::Notification {
+        ..encode_notification(notification)
+    };
+    let mut frame = frame;
+    frame.app_icon = icon.as_ref().map(wire_image);
+    frame.image = image.as_ref().map(wire_image);
+    let images = icon.into_iter().chain(image).collect();
+    Ok(EncodedNotification { frame, images })
+}
+
+fn wire_image(metadata: &crate::transfer::BlobMetadata) -> wire::NotificationImage {
+    wire::NotificationImage {
+        mime_type: metadata.mime_type.clone(),
+        size: metadata.size,
+        sha256: metadata.sha256.to_vec(),
+    }
+}
+
+/// Validates notification artwork without encoding a frame.
+pub(crate) fn validate_notification_images(
+    notification: &Notification,
+) -> Result<(), ProtocolError> {
+    inspect_notification_image(notification.app_icon.as_ref(), MAX_NOTIFICATION_ICON_BYTES)?;
+    inspect_notification_image(notification.image.as_ref(), MAX_NOTIFICATION_IMAGE_BYTES)?;
+    Ok(())
+}
+
+fn inspect_notification_image(
+    image: Option<&crate::NotificationImage>,
+    limit: u64,
+) -> Result<Option<crate::transfer::BlobMetadata>, ProtocolError> {
+    let Some(image) = image else {
+        return Ok(None);
+    };
+    let metadata =
+        crate::transfer::inspect_file(&image.mime_type, std::path::Path::new(&image.path))
+            .map_err(|_| ProtocolError::InvalidNotification("image"))?;
+    if metadata.size > limit {
+        return Err(ProtocolError::NotificationImageTooLarge);
+    }
+    Ok(Some(metadata))
+}
+
 pub(crate) fn encode_notification(notification: &Notification) -> wire::Notification {
     wire::Notification {
         id: notification.id.clone(),
@@ -276,7 +348,55 @@ pub(crate) fn encode_notification(notification: &Notification) -> wire::Notifica
             NotificationKind::Other => wire::NotificationKind::Other,
         }
         .into(),
+        app_icon: None,
+        image: None,
     }
+}
+
+fn decode_notification_image(
+    image: &wire::NotificationImage,
+    limit: u64,
+) -> Result<crate::transfer::BlobMetadata, ProtocolError> {
+    crate::transfer::validate_mime_type(&image.mime_type)
+        .map_err(|_| ProtocolError::InvalidNotification("image"))?;
+    crate::transfer::validate_size(image.size)
+        .map_err(|_| ProtocolError::InvalidNotification("image"))?;
+    if image.size > limit {
+        return Err(ProtocolError::NotificationImageTooLarge);
+    }
+    let sha256: [u8; 32] = image
+        .sha256
+        .as_slice()
+        .try_into()
+        .map_err(|_| ProtocolError::InvalidNotification("image"))?;
+    Ok(crate::transfer::BlobMetadata {
+        mime_type: image.mime_type.clone(),
+        size: image.size,
+        sha256,
+    })
+}
+
+/// Decodes notification metadata and returns the images to read next.
+pub(crate) fn decode_notification_with_images(
+    notification: wire::Notification,
+) -> Result<DecodedNotification, ProtocolError> {
+    let mut images = Vec::new();
+    if let Some(icon) = notification.app_icon.as_ref() {
+        images.push(decode_notification_image(
+            icon,
+            MAX_NOTIFICATION_ICON_BYTES,
+        )?);
+    }
+    if let Some(image) = notification.image.as_ref() {
+        images.push(decode_notification_image(
+            image,
+            MAX_NOTIFICATION_IMAGE_BYTES,
+        )?);
+    }
+    Ok(DecodedNotification {
+        notification: decode_notification(notification)?,
+        images,
+    })
 }
 
 pub(crate) fn decode_notification(
@@ -308,6 +428,20 @@ pub(crate) fn decode_notification(
                 NotificationKind::Other
             }
         },
+        app_icon: notification
+            .app_icon
+            .as_ref()
+            .map(|image| crate::NotificationImage {
+                mime_type: image.mime_type.clone(),
+                path: String::new(),
+            }),
+        image: notification
+            .image
+            .as_ref()
+            .map(|image| crate::NotificationImage {
+                mime_type: image.mime_type.clone(),
+                path: String::new(),
+            }),
     })
 }
 
