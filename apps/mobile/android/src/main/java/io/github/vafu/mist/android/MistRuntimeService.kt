@@ -49,6 +49,7 @@ public class MistRuntimeService : Service() {
     private var clipboard: Clipboard? = null
     private var media: Media? = null
     private var androidMedia: AndroidMedia? = null
+    private var mediaSession: MistMediaSession? = null
 
     private val mediaHandler: MediaCommandHandler = object : MediaCommandHandler {
         override fun command(
@@ -173,6 +174,10 @@ public class MistRuntimeService : Service() {
         intent?.let(MistServiceStarter::sharePayload)?.let { payload ->
             scope.launch { sendShare(payload) }
         }
+        if (intent?.action == MistServiceStarter.ACTION_MEDIA_COMMAND) {
+            val command = intent.getStringExtra(MistServiceStarter.EXTRA_MEDIA_COMMAND)
+            dispatchMediaCommand(command)
+        }
         return START_STICKY
     }
 
@@ -257,6 +262,13 @@ public class MistRuntimeService : Service() {
             scope.launch { receiveRemoteNotifications() }
             scope.launch { receiveClipboard() }
             androidMedia = AndroidMedia(this@MistRuntimeService).also { it.start() }
+            mediaSession = MistMediaSession(this@MistRuntimeService) { playerId, command ->
+                scope.launch {
+                    runCatching { runtime.media().command(playerId, command) }
+                        .onFailure { Log.e(TAG, "Could not send media command", it) }
+                }
+            }.also { it.start() }
+            scope.launch { forwardMediaEvents() }
         }.onFailure { error ->
             Log.e(TAG, "Mist runtime failed to start", error)
             runtimeReady.complete(null)
@@ -357,6 +369,33 @@ public class MistRuntimeService : Service() {
             }
         } finally {
             callbacks.finishBroadcast()
+        }
+    }
+
+    /** Forwards media player changes into the local media session. */
+    private suspend fun forwardMediaEvents() {
+        val media = media ?: return
+        val stream = media.subscribe()
+        try {
+            // Seed the session with the current player set.
+            mediaSession?.update(media.list())
+            while (true) {
+                stream.next()
+                mediaSession?.update(media.list())
+            }
+        } finally {
+            stream.close()
+        }
+    }
+
+    private fun dispatchMediaCommand(raw: String?) {
+        val command = runCatching {
+            io.github.vafu.mist.core.MediaCommand.valueOf(raw.orEmpty())
+        }.getOrNull() ?: return
+        val playerId = mediaSession?.remotePlayerId() ?: return
+        scope.launch {
+            runCatching { media?.command(playerId, command) }
+                .onFailure { Log.e(TAG, "media command from notification failed", it) }
         }
     }
 
@@ -465,6 +504,8 @@ public class MistRuntimeService : Service() {
             .build()
 
     private fun closeRuntimeHandles() {
+        mediaSession?.release()
+        mediaSession = null
         androidMedia?.stop()
         media?.close()
         clipboard?.close()

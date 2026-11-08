@@ -9,6 +9,8 @@ internal object MistServiceStarter {
     const val ACTION_START: String = "io.github.vafu.mist.action.START"
     const val ACTION_STOP: String = "io.github.vafu.mist.action.STOP"
     const val ACTION_SHARE: String = "io.github.vafu.mist.action.SHARE"
+    const val ACTION_MEDIA_COMMAND: String = "io.github.vafu.mist.action.MEDIA_COMMAND"
+    const val EXTRA_MEDIA_COMMAND: String = "media_command"
     private const val EXTRA_SHARE_TEXT: String = "share_text"
     private const val EXTRA_SHARE_URI: String = "share_uri"
     private const val EXTRA_SHARE_MIME_TYPE: String = "share_mime_type"
@@ -45,6 +47,11 @@ internal object MistServiceStarter {
         val mimeType = intent.getStringExtra(EXTRA_SHARE_MIME_TYPE) ?: return null
         return SharePayload.Image(android.net.Uri.parse(uri), mimeType)
     }
+
+    fun mediaCommandIntent(context: Context, command: String): Intent =
+        serviceIntent(context, ACTION_MEDIA_COMMAND).apply {
+            putExtra(EXTRA_MEDIA_COMMAND, command)
+        }
 
     fun stop(context: Context) {
         context.stopService(Intent(context, MistRuntimeService::class.java))
