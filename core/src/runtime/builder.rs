@@ -95,7 +95,7 @@ impl MistBuilder {
         let endpoint = self.endpoint.bind().await?;
         MistRuntime::from_endpoint(
             endpoint,
-            self.device_info,
+            &self.device_info,
             self.store,
             self.local_addresses,
             self.blob_directory,

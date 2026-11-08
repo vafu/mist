@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{Clipboard, DeviceManager, NotificationChannel, Pairing};
+use crate::{Clipboard, DeviceManager, Media, NotificationChannel, Pairing};
 
 /// Root application contract for one running Mist instance.
 ///
@@ -26,6 +26,9 @@ pub trait MistApp: Send + Sync + Debug {
 
     /// Returns the clipboard sharing service.
     fn clipboard(&self) -> Arc<dyn Clipboard>;
+
+    /// Returns the media player service.
+    fn media(&self) -> Arc<dyn Media>;
 
     /// Closes active sessions and the local endpoint.
     async fn shutdown(&self);

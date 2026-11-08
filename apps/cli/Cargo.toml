@@ -19,6 +19,7 @@ name = "mist_linux"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = "=0.1.89"
 futures-util.workspace = true
 iroh.workspace = true
 mist-core = { path = "../../core" }

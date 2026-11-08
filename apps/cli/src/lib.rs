@@ -1,6 +1,7 @@
 //! Shared Linux D-Bus contract used by the daemon and CLI.
 
 pub mod clipboard;
+pub mod media;
 
 /// Well-known session bus name owned by `mistd`.
 pub const BUS_NAME: &str = "io.github.vafu.Mist";
@@ -12,6 +13,20 @@ pub const INTERFACE_NAME: &str = "io.github.vafu.Mist1";
 /// Serialized D-Bus device row: endpoint ID, display name, device class,
 /// platform, status, transport, selected.
 pub type DeviceRow = (String, String, String, String, String, String, bool);
+
+/// Serialized media player row: id, endpoint id, name, device name, origin,
+/// status, title, artist, album.
+pub type MediaRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 #[zbus::proxy(
     interface = "io.github.vafu.Mist1",
@@ -52,6 +67,13 @@ pub trait Mist {
     /// Sends a notification to selected devices.
     fn push_notification(&self, title: &str, body: &str) -> zbus::Result<()>;
 
+    /// Current media players, local and remote.
+    #[zbus(property)]
+    fn media_players(&self) -> zbus::Result<Vec<MediaRow>>;
+
+    /// Sends a transport command to a media player.
+    fn media_command(&self, player_id: &str, command: &str) -> zbus::Result<()>;
+
     /// Sends text clipboard content to selected devices.
     fn push_clipboard_text(&self, text: &str) -> zbus::Result<()>;
 
@@ -78,6 +100,10 @@ pub trait Mist {
     /// Background pairing failed after an offer was returned.
     #[zbus(signal)]
     fn pairing_failed(&self, reason: &str) -> zbus::Result<()>;
+
+    /// A media player snapshot changed.
+    #[zbus(signal)]
+    fn media_changed(&self) -> zbus::Result<()>;
 
     /// Clipboard content arrived from another device.
     #[zbus(signal)]

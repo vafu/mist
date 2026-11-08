@@ -78,3 +78,81 @@ fn notification_round_trips_between_domain_and_wire_types() {
         notification
     );
 }
+
+#[test]
+fn media_snapshot_and_command_round_trip() {
+    use crate::{
+        MediaCapabilities, MediaCommand, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
+    };
+
+    let player = MediaPlayer {
+        id: "player-1".to_owned(),
+        endpoint_id: String::new(),
+        name: "Player".to_owned(),
+        device: crate::DeviceInfo {
+            display_name: "laptop".to_owned(),
+            device_class: crate::DeviceClass::Laptop,
+            platform: crate::Platform::Linux,
+        },
+        origin: MediaOrigin::Local,
+        status: PlaybackStatus::Playing,
+        metadata: MediaMetadata {
+            title: "Track".to_owned(),
+            artist: "Artist".to_owned(),
+            album: "Album".to_owned(),
+            art_url: "https://example.invalid/art.png".to_owned(),
+            duration_ms: Some(123_000),
+        },
+        capabilities: MediaCapabilities {
+            commands: vec![MediaCommand::Play, MediaCommand::Pause, MediaCommand::Next],
+        },
+        position_ms: Some(4_000),
+    };
+
+    let snapshot = super::encode_media_snapshot(&[player]);
+    let decoded = super::decode_media_snapshot(snapshot).unwrap();
+    assert_eq!(decoded.len(), 1);
+    let state = &decoded[0];
+    assert_eq!(state.id, "player-1");
+    assert_eq!(state.status, PlaybackStatus::Playing);
+    assert_eq!(state.metadata.title, "Track");
+    assert_eq!(state.metadata.duration_ms, Some(123_000));
+    assert_eq!(state.position_ms, Some(4_000));
+    assert!(state.capabilities.supports(MediaCommand::Next));
+    assert!(!state.capabilities.supports(MediaCommand::Previous));
+
+    let wire = super::encode_media_command("player-1", MediaCommand::Previous);
+    let (id, command) = super::decode_media_command(wire).unwrap();
+    assert_eq!(id, "player-1");
+    assert_eq!(command, MediaCommand::Previous);
+}
+
+#[test]
+fn media_snapshot_rejects_empty_player_ids() {
+    use super::wire::{MediaCapabilities, MediaMetadata, MediaSnapshot, MediaState};
+
+    let snapshot = MediaSnapshot {
+        players: vec![MediaState {
+            player_id: String::new(),
+            name: "Player".to_owned(),
+            status: 1,
+            metadata: Some(MediaMetadata {
+                title: String::new(),
+                artist: String::new(),
+                album: String::new(),
+                art_url: String::new(),
+                duration_ms: 0,
+                has_duration: false,
+            }),
+            capabilities: Some(MediaCapabilities {
+                can_play: true,
+                can_pause: true,
+                can_go_next: false,
+                can_go_previous: false,
+            }),
+            position_ms: 0,
+            has_position: false,
+        }],
+    };
+    assert!(super::decode_media_snapshot(snapshot).is_err());
+}

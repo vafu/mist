@@ -23,6 +23,7 @@ const MAX_CONTROL_FRAME_SIZE: usize = 64 * 1024;
     dead_code,
     clippy::doc_markdown,
     clippy::trivially_copy_pass_by_ref,
+    clippy::struct_excessive_bools,
     reason = "wire messages are landed before their protocol handlers"
 )]
 pub(crate) mod wire {
@@ -66,6 +67,8 @@ pub(crate) enum ProtocolError {
     InvalidClipboard(&'static str),
     #[error("clipboard payload does not match its MIME type")]
     ClipboardPayloadMismatch,
+    #[error("media field {0} exceeds its protocol limit")]
+    InvalidMedia(&'static str),
 }
 
 pub(crate) async fn write_control_frame(
@@ -318,6 +321,8 @@ pub(crate) fn message_name(body: &wire::control_frame::Body) -> &'static str {
         wire::control_frame::Body::Notification(_) => "notification",
         wire::control_frame::Body::AddressSnapshot(_) => "address snapshot",
         wire::control_frame::Body::ClipboardItem(_) => "clipboard item",
+        wire::control_frame::Body::MediaSnapshot(_) => "media snapshot",
+        wire::control_frame::Body::MediaCommand(_) => "media command",
     }
 }
 
@@ -416,4 +421,167 @@ fn validate_clipboard_common(mime_type: &str) -> Result<(), ProtocolError> {
         return Err(ProtocolError::InvalidClipboard("mime type"));
     }
     Ok(())
+}
+
+/// Validated media player state carried over the wire.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaPlayerState {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) status: crate::PlaybackStatus,
+    pub(crate) metadata: crate::MediaMetadata,
+    pub(crate) capabilities: crate::MediaCapabilities,
+    pub(crate) position_ms: Option<u64>,
+}
+
+const MAX_MEDIA_ID_LENGTH: usize = 256;
+const MAX_MEDIA_NAME_LENGTH: usize = 256;
+const MAX_MEDIA_TEXT_LENGTH: usize = 512;
+const MAX_MEDIA_ART_URL_LENGTH: usize = 4096;
+
+pub(crate) fn encode_media_snapshot(players: &[crate::MediaPlayer]) -> wire::MediaSnapshot {
+    let players = players
+        .iter()
+        .filter(|player| player.origin == crate::MediaOrigin::Local)
+        .map(|player| wire::MediaState {
+            player_id: player.id.clone(),
+            name: player.name.clone(),
+            status: wire_status(player.status).into(),
+            metadata: Some(wire::MediaMetadata {
+                title: player.metadata.title.clone(),
+                artist: player.metadata.artist.clone(),
+                album: player.metadata.album.clone(),
+                art_url: player.metadata.art_url.clone(),
+                duration_ms: player.metadata.duration_ms.unwrap_or_default(),
+                has_duration: player.metadata.duration_ms.is_some(),
+            }),
+            capabilities: Some(wire::MediaCapabilities {
+                can_play: player.capabilities.supports(crate::MediaCommand::Play)
+                    || player.capabilities.supports(crate::MediaCommand::PlayPause),
+                can_pause: player.capabilities.supports(crate::MediaCommand::Pause)
+                    || player.capabilities.supports(crate::MediaCommand::PlayPause),
+                can_go_next: player.capabilities.supports(crate::MediaCommand::Next),
+                can_go_previous: player.capabilities.supports(crate::MediaCommand::Previous),
+            }),
+            position_ms: player.position_ms.unwrap_or_default(),
+            has_position: player.position_ms.is_some(),
+        })
+        .collect();
+    wire::MediaSnapshot { players }
+}
+
+pub(crate) fn decode_media_snapshot(
+    snapshot: wire::MediaSnapshot,
+) -> Result<Vec<MediaPlayerState>, ProtocolError> {
+    snapshot
+        .players
+        .into_iter()
+        .map(decode_media_player)
+        .collect()
+}
+
+fn decode_media_player(player: wire::MediaState) -> Result<MediaPlayerState, ProtocolError> {
+    if player.player_id.is_empty() || player.player_id.len() > MAX_MEDIA_ID_LENGTH {
+        return Err(ProtocolError::InvalidMedia("player id"));
+    }
+    if player.name.chars().count() > MAX_MEDIA_NAME_LENGTH {
+        return Err(ProtocolError::InvalidMedia("name"));
+    }
+    let metadata = player
+        .metadata
+        .ok_or(ProtocolError::InvalidMedia("metadata"))?;
+    for (field, value) in [
+        ("title", &metadata.title),
+        ("artist", &metadata.artist),
+        ("album", &metadata.album),
+    ] {
+        if value.chars().count() > MAX_MEDIA_TEXT_LENGTH {
+            return Err(ProtocolError::InvalidMedia(field));
+        }
+    }
+    if metadata.art_url.len() > MAX_MEDIA_ART_URL_LENGTH {
+        return Err(ProtocolError::InvalidMedia("art url"));
+    }
+    let capabilities = player
+        .capabilities
+        .ok_or(ProtocolError::InvalidMedia("capabilities"))?;
+    Ok(MediaPlayerState {
+        id: player.player_id,
+        name: player.name,
+        status: match wire::PlaybackStatus::try_from(player.status) {
+            Ok(wire::PlaybackStatus::Playing) => crate::PlaybackStatus::Playing,
+            Ok(wire::PlaybackStatus::Paused) => crate::PlaybackStatus::Paused,
+            Ok(wire::PlaybackStatus::Stopped) | Err(_) => crate::PlaybackStatus::Stopped,
+        },
+        metadata: crate::MediaMetadata {
+            title: metadata.title,
+            artist: metadata.artist,
+            album: metadata.album,
+            art_url: metadata.art_url,
+            duration_ms: metadata.has_duration.then_some(metadata.duration_ms),
+        },
+        capabilities: capabilities_from_wire(capabilities),
+        position_ms: player.has_position.then_some(player.position_ms),
+    })
+}
+
+fn capabilities_from_wire(capabilities: wire::MediaCapabilities) -> crate::MediaCapabilities {
+    let mut commands = Vec::new();
+    if capabilities.can_play {
+        commands.push(crate::MediaCommand::Play);
+    }
+    if capabilities.can_pause {
+        commands.push(crate::MediaCommand::Pause);
+    }
+    if capabilities.can_go_next {
+        commands.push(crate::MediaCommand::Next);
+    }
+    if capabilities.can_go_previous {
+        commands.push(crate::MediaCommand::Previous);
+    }
+    crate::MediaCapabilities { commands }
+}
+
+fn wire_status(status: crate::PlaybackStatus) -> wire::PlaybackStatus {
+    match status {
+        crate::PlaybackStatus::Playing => wire::PlaybackStatus::Playing,
+        crate::PlaybackStatus::Paused => wire::PlaybackStatus::Paused,
+        crate::PlaybackStatus::Stopped => wire::PlaybackStatus::Stopped,
+    }
+}
+
+pub(crate) fn encode_media_command(
+    player_id: &str,
+    command: crate::MediaCommand,
+) -> wire::MediaCommandRequest {
+    wire::MediaCommandRequest {
+        player_id: player_id.to_owned(),
+        command: match command {
+            crate::MediaCommand::Play => wire::MediaCommand::Play,
+            crate::MediaCommand::Pause => wire::MediaCommand::Pause,
+            crate::MediaCommand::PlayPause => wire::MediaCommand::PlayPause,
+            crate::MediaCommand::Stop => wire::MediaCommand::Stop,
+            crate::MediaCommand::Next => wire::MediaCommand::Next,
+            crate::MediaCommand::Previous => wire::MediaCommand::Previous,
+        }
+        .into(),
+    }
+}
+
+pub(crate) fn decode_media_command(
+    request: wire::MediaCommandRequest,
+) -> Result<(String, crate::MediaCommand), ProtocolError> {
+    if request.player_id.is_empty() || request.player_id.len() > MAX_MEDIA_ID_LENGTH {
+        return Err(ProtocolError::InvalidMedia("player id"));
+    }
+    let command = match wire::MediaCommand::try_from(request.command) {
+        Ok(wire::MediaCommand::Play) => crate::MediaCommand::Play,
+        Ok(wire::MediaCommand::Pause) => crate::MediaCommand::Pause,
+        Ok(wire::MediaCommand::PlayPause) => crate::MediaCommand::PlayPause,
+        Ok(wire::MediaCommand::Stop) => crate::MediaCommand::Stop,
+        Ok(wire::MediaCommand::Next) => crate::MediaCommand::Next,
+        Ok(wire::MediaCommand::Previous) => crate::MediaCommand::Previous,
+        Err(_) => return Err(ProtocolError::InvalidMedia("command")),
+    };
+    Ok((request.player_id, command))
 }

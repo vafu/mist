@@ -7,6 +7,7 @@
 mod app;
 mod clipboard;
 mod device;
+mod media;
 mod notification;
 mod pairing;
 
@@ -17,6 +18,10 @@ pub use clipboard::{
 pub use device::{
     ConnectionTransport, DeviceClass, DeviceError, DeviceEvent, DeviceEventError, DeviceEventKind,
     DeviceEventStream, DeviceInfo, DeviceManager, DeviceStatus, ManagedDevice, Platform,
+};
+pub use media::{
+    Media, MediaCapabilities, MediaCommand, MediaError, MediaEvent, MediaEventKind,
+    MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
 };
 pub use notification::{
     Notification, NotificationChannel, NotificationError, NotificationEventStream,

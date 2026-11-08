@@ -30,6 +30,8 @@ pub enum StartupError {
     Bind { reason: String },
 }
 
+pub use crate::media::{LocalPlayer, MediaProvider, MediaProviderError, MediaWatcher};
+
 /// Host composition builder for a persistent Mist runtime.
 ///
 /// Custom transports and address lookups belong here because they configure
@@ -37,6 +39,7 @@ pub enum StartupError {
 #[derive(Debug)]
 pub struct MistFactory {
     builder: MistBuilder,
+    media: Option<Arc<dyn MediaProvider>>,
 }
 
 impl MistFactory {
@@ -81,6 +84,7 @@ impl MistFactory {
                 .address_lookup(lookup)
                 .state_store(store)
                 .blob_directory(storage_directory.as_ref().join("clipboard")),
+            media: None,
         })
     }
 
@@ -105,6 +109,13 @@ impl MistFactory {
         self
     }
 
+    /// Attaches the platform media backend.
+    #[must_use]
+    pub fn media(mut self, provider: Arc<dyn MediaProvider>) -> Self {
+        self.media = Some(provider);
+        self
+    }
+
     /// Binds the endpoint and returns only the stable application contract.
     ///
     /// # Errors
@@ -114,7 +125,12 @@ impl MistFactory {
         self.builder
             .bind()
             .await
-            .map(|runtime| runtime as Arc<dyn MistApp>)
+            .map(|runtime| {
+                if let Some(provider) = self.media {
+                    runtime.attach_media(&provider);
+                }
+                runtime as Arc<dyn MistApp>
+            })
             .map_err(|error| StartupError::Bind {
                 reason: error.to_string(),
             })

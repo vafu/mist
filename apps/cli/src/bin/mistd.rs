@@ -9,11 +9,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use mist_app_contract::{
     ClipboardContent, ConnectionTransport, DeviceClass, DeviceInfo, DeviceStatus, ManagedDevice,
-    MistApp, Notification, NotificationKind, Platform,
+    MediaCommand, MistApp, Notification, NotificationKind, Platform,
 };
 use mist_core::host::MistFactory;
 use mist_linux::clipboard::{LocalClipboardProvider, WaylandClipboard};
-use mist_linux::{BUS_NAME, DeviceRow, OBJECT_PATH};
+use mist_linux::media::{MprisMedia, MprisPublisher};
+use mist_linux::{BUS_NAME, DeviceRow, MediaRow, OBJECT_PATH};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use zbus::object_server::SignalEmitter;
@@ -71,6 +72,27 @@ impl MistDbus {
             .iter()
             .map(device_row)
             .collect()
+    }
+
+    #[zbus(property, name = "MediaPlayers")]
+    fn media_players(&self) -> Vec<MediaRow> {
+        self.runtime
+            .media()
+            .list()
+            .into_iter()
+            .map(media_row)
+            .collect()
+    }
+
+    async fn media_command(&self, player_id: &str, command: &str) -> zbus::fdo::Result<()> {
+        let command = parse_media_command(command).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("unknown media command {command}"))
+        })?;
+        self.runtime
+            .media()
+            .command(player_id.to_owned(), command)
+            .await
+            .map_err(fdo_error)
     }
 
     #[zbus(property, name = "Connected")]
@@ -223,9 +245,12 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let runtime = MistFactory::new(state_directory()?, local_device_info())?
-        .create()
-        .await?;
+    let mpris = MprisMedia::new().await.ok();
+    let mut factory = MistFactory::new(state_directory()?, local_device_info())?;
+    if let Some(mpris) = mpris.as_ref() {
+        factory = factory.media(mpris.clone());
+    }
+    let runtime = factory.create().await?;
     let connection = Connection::session().await?;
     connection.request_name(BUS_NAME).await?;
     let (shutdown, mut shutdown_rx) = watch::channel(false);
@@ -258,6 +283,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     ));
     let mut local_clipboard_changes =
         tokio::spawn(watch_local_clipboard(Arc::clone(&runtime), local_clipboard));
+    let mut published_media = tokio::spawn(publish_remote_media(
+        connection.clone(),
+        Arc::clone(&runtime),
+    ));
 
     println!("mistd ready on {BUS_NAME} ({})", runtime.endpoint_id());
     tokio::select! {
@@ -270,6 +299,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         result = &mut monitored_notifications => result??,
         result = &mut incoming_clipboard => result??,
         result = &mut local_clipboard_changes => result??,
+        result = &mut published_media => result??,
     }
 
     device_events.abort();
@@ -277,6 +307,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     monitored_notifications.abort();
     incoming_clipboard.abort();
     local_clipboard_changes.abort();
+    published_media.abort();
     runtime.shutdown().await;
     Ok(())
 }
@@ -482,6 +513,42 @@ async fn forward_incoming_clipboard(
             .clipboard_received(&received.source_endpoint_id, &mime_type, &text, &path)
             .await?;
     }
+}
+
+/// Exports remote players as local MPRIS players for desktop media controls.
+async fn publish_remote_media(
+    connection: Connection,
+    runtime: Arc<dyn MistApp>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let publisher = Arc::new(MprisPublisher::new(connection, runtime.media()));
+    publisher.run().await;
+    Ok(())
+}
+
+fn parse_media_command(command: &str) -> Option<MediaCommand> {
+    Some(match command {
+        "play" => MediaCommand::Play,
+        "pause" => MediaCommand::Pause,
+        "play-pause" => MediaCommand::PlayPause,
+        "stop" => MediaCommand::Stop,
+        "next" => MediaCommand::Next,
+        "previous" => MediaCommand::Previous,
+        _ => return None,
+    })
+}
+
+fn media_row(player: mist_app_contract::MediaPlayer) -> MediaRow {
+    (
+        player.id,
+        player.endpoint_id,
+        player.name,
+        player.device.display_name,
+        format!("{:?}", player.origin).to_lowercase(),
+        format!("{:?}", player.status).to_lowercase(),
+        player.metadata.title,
+        player.metadata.artist,
+        player.metadata.album,
+    )
 }
 
 fn device_row(device: &ManagedDevice) -> DeviceRow {

@@ -25,20 +25,23 @@ use self::outbox::{Outbound, Outbox};
 use self::registry::DeviceRegistry;
 use crate::clipboard::IrohClipboard;
 use crate::device::RuntimeDeviceManager;
+use crate::media::{IrohMedia, MediaProvider, MediaRegistry};
 use crate::notification::IrohNotificationChannel;
 use crate::pairing::IrohPairing;
 use crate::protocol::wire::{ControlFrame, PairingAuthenticate, control_frame};
 use crate::protocol::{
     ClipboardMetadata, address_snapshot, decode_address_snapshot, decode_clipboard_item,
-    decode_notification, decode_session_hello, read_control_frame, session_hello,
+    decode_media_command, decode_media_snapshot, decode_notification, decode_session_hello,
+    encode_media_command, encode_media_snapshot, read_control_frame, session_hello,
     write_control_frame,
 };
 use crate::storage::{AddressSource, StateStore, StoreError};
 use crate::transfer::{BlobMetadata, inspect_file, receive_blob};
 use crate::{
     Clipboard, ClipboardContent, ClipboardError, DeviceError, DeviceInfo, DeviceManager, MIST_ALPN,
-    ManagedDevice, MistApp, Notification, NotificationChannel, NotificationError, NotificationKind,
-    Pairing, ReceivedClipboard, ReceivedNotification,
+    ManagedDevice, MediaCommand, MediaError, MediaEvent, MediaPlayer, MistApp, Notification,
+    NotificationChannel, NotificationError, NotificationKind, Pairing, ReceivedClipboard,
+    ReceivedNotification,
 };
 
 pub(crate) use builder::MistBuilder;
@@ -91,13 +94,15 @@ pub(crate) struct Session {
     pairing_attempts_rx: Arc<Mutex<mpsc::Receiver<IncomingPairingAttempt>>>,
     outbox: Outbox,
     reconnecting: StdMutex<std::collections::HashSet<EndpointId>>,
+    media: MediaRegistry,
+    media_provider: StdMutex<Option<Arc<dyn MediaProvider>>>,
     executor: Handle,
 }
 
 impl Session {
     fn new(
         endpoint: Endpoint,
-        device_info: DeviceInfo,
+        device_info: &DeviceInfo,
         store: Arc<dyn StateStore>,
         local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
         blob_directory: std::path::PathBuf,
@@ -108,7 +113,7 @@ impl Session {
         let devices = DeviceRegistry::new(store.load_devices()?);
         Ok(Arc::new(Self {
             endpoint,
-            device_info,
+            device_info: device_info.clone(),
             devices,
             store,
             local_addresses,
@@ -120,6 +125,8 @@ impl Session {
             pairing_attempts_rx: Arc::new(Mutex::new(pairing_attempts_rx)),
             outbox: Outbox::default(),
             reconnecting: StdMutex::new(std::collections::HashSet::new()),
+            media: MediaRegistry::new(device_info.clone()),
+            media_provider: StdMutex::new(None),
             executor: Handle::current(),
         }))
     }
@@ -162,6 +169,149 @@ impl Session {
         self.clipboard.subscribe()
     }
 
+    pub(crate) fn subscribe_media(&self) -> broadcast::Receiver<MediaEvent> {
+        self.media.subscribe()
+    }
+
+    pub fn media_players(&self) -> Vec<MediaPlayer> {
+        self.media.list()
+    }
+
+    /// Attaches the platform media backend and starts watching it.
+    pub fn attach_media(self: &Arc<Self>, provider: &Arc<dyn MediaProvider>) {
+        let session = Arc::clone(self);
+        *self
+            .media_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(provider));
+        let Some(watcher) = provider.watch().ok() else {
+            return;
+        };
+        self.publish_media_snapshot();
+        self.executor.spawn_blocking(move || {
+            let mut watcher = watcher;
+            loop {
+                match watcher.next() {
+                    Ok(Some(players)) => {
+                        session.media.set_local(&players);
+                        session.publish_media_snapshot();
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        });
+    }
+
+    /// Sends the current local player snapshot to one peer.
+    fn send_media_snapshot_to(self: &Arc<Self>, connection: Connection) {
+        let snapshot = encode_media_snapshot(&self.media.list());
+        self.executor.spawn(async move {
+            let Ok(mut stream) = connection.open_uni().await else {
+                return;
+            };
+            let frame = ControlFrame {
+                body: Some(control_frame::Body::MediaSnapshot(snapshot)),
+            };
+            if write_control_frame(&mut stream, &frame).await.is_ok() {
+                let _ = stream.finish();
+            }
+        });
+    }
+
+    /// Broadcasts the local player snapshot to every connected peer.
+    fn publish_media_snapshot(self: &Arc<Self>) {
+        let players = self.media.list();
+        let snapshot = encode_media_snapshot(&players);
+        let connections = self.devices.selected_connections();
+        for (endpoint_id, connection) in connections {
+            let Some(connection) = connection else {
+                continue;
+            };
+            let _ = endpoint_id;
+            let snapshot = snapshot.clone();
+            self.executor.spawn(async move {
+                let Ok(mut stream) = connection.open_uni().await else {
+                    return;
+                };
+                let frame = ControlFrame {
+                    body: Some(control_frame::Body::MediaSnapshot(snapshot)),
+                };
+                if write_control_frame(&mut stream, &frame).await.is_ok() {
+                    let _ = stream.finish();
+                }
+            });
+        }
+    }
+
+    /// Routes a transport command to a remote player.
+    pub(crate) async fn send_media_command(
+        self: &Arc<Self>,
+        player_id: String,
+        command: MediaCommand,
+    ) -> Result<(), MediaError> {
+        let player = self
+            .media
+            .list()
+            .into_iter()
+            .find(|player| player.id == player_id)
+            .ok_or_else(|| MediaError::UnknownPlayer {
+                player_id: player_id.clone(),
+            })?;
+        match player.origin {
+            crate::MediaOrigin::Local => {
+                let provider = self
+                    .media_provider
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+                    .ok_or_else(|| MediaError::Transport {
+                        reason: "no local media backend".to_owned(),
+                    })?;
+                provider
+                    .command(&player_id, command)
+                    .await
+                    .map_err(|error| MediaError::Transport {
+                        reason: error.to_string(),
+                    })
+            }
+            crate::MediaOrigin::Remote => {
+                let endpoint_id = EndpointId::from_str(&player.endpoint_id).map_err(|error| {
+                    MediaError::Transport {
+                        reason: error.to_string(),
+                    }
+                })?;
+                let connection =
+                    self.devices
+                        .connection(endpoint_id)
+                        .ok_or_else(|| MediaError::Transport {
+                            reason: format!("device {endpoint_id} is disconnected"),
+                        })?;
+                let mut stream =
+                    connection
+                        .open_uni()
+                        .await
+                        .map_err(|error| MediaError::Transport {
+                            reason: error.to_string(),
+                        })?;
+                write_control_frame(
+                    &mut stream,
+                    &ControlFrame {
+                        body: Some(control_frame::Body::MediaCommand(encode_media_command(
+                            &player_id, command,
+                        ))),
+                    },
+                )
+                .await
+                .map_err(|error| MediaError::Transport {
+                    reason: error.to_string(),
+                })?;
+                stream.finish().map_err(|error| MediaError::Transport {
+                    reason: error.to_string(),
+                })
+            }
+        }
+    }
+
     pub(crate) async fn next_pairing_attempt(&self) -> Option<IncomingPairingAttempt> {
         self.pairing_attempts_rx.lock().await.recv().await
     }
@@ -191,6 +341,7 @@ impl Session {
         self.start_connection_worker(connection.clone(), generation);
         self.start_address_publisher(connection.clone());
         self.start_outbox_flush(connection.clone());
+        self.send_media_snapshot_to(connection.clone());
         Ok(connection)
     }
 
@@ -286,6 +437,7 @@ impl Session {
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&(endpoint_id, generation));
             session.devices.mark_disconnected(endpoint_id, generation);
+            session.media.remove_remote(&endpoint_id.to_string());
         });
     }
 
@@ -356,6 +508,12 @@ impl Session {
                     sha256: hex(&sha256),
                 });
             }
+            Some(control_frame::Body::MediaSnapshot(snapshot)) => {
+                self.receive_media_snapshot(endpoint_id, snapshot);
+            }
+            Some(control_frame::Body::MediaCommand(request)) => {
+                self.receive_media_command(request).await;
+            }
             Some(control_frame::Body::AddressSnapshot(snapshot)) => {
                 if !self.accept_address_revision(endpoint_id, generation, snapshot.revision) {
                     return;
@@ -367,6 +525,39 @@ impl Session {
                     self.sync_addresses(endpoint_id, AddressSource::AuthenticatedPeer, &addresses);
             }
             _ => {}
+        }
+    }
+
+    fn receive_media_snapshot(
+        &self,
+        endpoint_id: EndpointId,
+        snapshot: crate::protocol::wire::MediaSnapshot,
+    ) {
+        let Ok(players) = decode_media_snapshot(snapshot) else {
+            return;
+        };
+        let Some(device) = self.devices.device_info(endpoint_id) else {
+            return;
+        };
+        let players = players
+            .iter()
+            .map(|player| crate::media::remote_player(&endpoint_id.to_string(), &device, player))
+            .collect::<Vec<_>>();
+        self.media
+            .set_remote(&endpoint_id.to_string(), &device, &players);
+    }
+
+    async fn receive_media_command(&self, request: crate::protocol::wire::MediaCommandRequest) {
+        let Ok((player_id, command)) = decode_media_command(request) else {
+            return;
+        };
+        let provider = self
+            .media_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(provider) = provider {
+            let _ = provider.command(&player_id, command).await;
         }
     }
 
@@ -756,12 +947,13 @@ pub(crate) struct MistRuntime {
     pairing: Arc<dyn Pairing>,
     notifications: Arc<dyn NotificationChannel>,
     clipboard: Arc<dyn Clipboard>,
+    media_service: Arc<dyn crate::Media>,
 }
 
 impl MistRuntime {
     pub(crate) fn from_endpoint(
         endpoint: Endpoint,
-        device_info: DeviceInfo,
+        device_info: &DeviceInfo,
         store: Arc<dyn StateStore>,
         local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
         blob_directory: std::path::PathBuf,
@@ -777,6 +969,7 @@ impl MistRuntime {
         let pairing = Arc::new(IrohPairing::new(Arc::clone(&session)));
         let notifications = Arc::new(IrohNotificationChannel::new(Arc::clone(&session)));
         let clipboard = Arc::new(IrohClipboard::new(Arc::clone(&session)));
+        let media_service = Arc::new(IrohMedia::new(Arc::clone(&session)));
         let devices = Arc::new(RuntimeDeviceManager::new(Arc::clone(&session)));
         Ok(Arc::new(Self {
             session,
@@ -784,6 +977,7 @@ impl MistRuntime {
             pairing,
             notifications,
             clipboard,
+            media_service,
         }))
     }
 
@@ -811,6 +1005,11 @@ impl MistRuntime {
 }
 
 impl MistRuntime {
+    /// Attaches the platform media backend.
+    pub fn attach_media(self: &Arc<Self>, provider: &Arc<dyn MediaProvider>) {
+        self.session.attach_media(provider);
+    }
+
     async fn shutdown_runtime(&self) {
         let session = Arc::clone(&self.session);
         let executor = session.executor().clone();
@@ -838,6 +1037,10 @@ impl MistApp for MistRuntime {
 
     fn clipboard(&self) -> Arc<dyn Clipboard> {
         Arc::clone(&self.clipboard)
+    }
+
+    fn media(&self) -> Arc<dyn crate::Media> {
+        Arc::clone(&self.media_service)
     }
 
     async fn shutdown(&self) {
