@@ -27,6 +27,11 @@ impl Media for IrohMedia {
         RuntimeMediaEventStream::new(self.session.subscribe_media())
     }
 
+    fn publish_local(&self, players: Vec<MediaPlayer>) -> Result<(), MediaError> {
+        self.session.publish_local_media(players);
+        Ok(())
+    }
+
     async fn command(&self, player_id: String, command: MediaCommand) -> Result<(), MediaError> {
         let session = Arc::clone(&self.session);
         let executor = session.executor().clone();

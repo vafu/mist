@@ -196,7 +196,7 @@ async fn collect_players(connection: &Connection) -> Result<Vec<LocalPlayer>, zb
         let Some(player_id) = name.strip_prefix(MPRIS_PREFIX) else {
             continue;
         };
-        if name == MIST_PLAYER_NAME {
+        if name == MIST_PLAYER_NAME || name.starts_with("org.mpris.MediaPlayer2.mist.") {
             continue;
         }
         if let Ok(player) = read_player(connection, player_id).await {

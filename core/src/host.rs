@@ -31,6 +31,7 @@ pub enum StartupError {
 }
 
 pub use crate::media::{LocalPlayer, MediaProvider, MediaProviderError, MediaWatcher};
+pub use mist_app_contract::MediaCommandHandler;
 
 /// Host composition builder for a persistent Mist runtime.
 ///
@@ -40,6 +41,7 @@ pub use crate::media::{LocalPlayer, MediaProvider, MediaProviderError, MediaWatc
 pub struct MistFactory {
     builder: MistBuilder,
     media: Option<Arc<dyn MediaProvider>>,
+    media_handler: Option<Arc<dyn MediaCommandHandler>>,
 }
 
 impl MistFactory {
@@ -85,6 +87,7 @@ impl MistFactory {
                 .state_store(store)
                 .blob_directory(storage_directory.as_ref().join("clipboard")),
             media: None,
+            media_handler: None,
         })
     }
 
@@ -116,6 +119,16 @@ impl MistFactory {
         self
     }
 
+    /// Registers a callback handler for inbound media commands.
+    ///
+    /// Used by hosts that push local state through generated bindings instead of
+    /// a native provider, such as Android.
+    #[must_use]
+    pub fn media_command_handler(mut self, handler: Arc<dyn MediaCommandHandler>) -> Self {
+        self.media_handler = Some(handler);
+        self
+    }
+
     /// Binds the endpoint and returns only the stable application contract.
     ///
     /// # Errors
@@ -128,6 +141,9 @@ impl MistFactory {
             .map(|runtime| {
                 if let Some(provider) = self.media {
                     runtime.attach_media(&provider);
+                }
+                if let Some(handler) = self.media_handler {
+                    runtime.set_media_command_handler(handler);
                 }
                 runtime as Arc<dyn MistApp>
             })
@@ -153,6 +169,33 @@ pub async fn create_mist_app(
 ) -> Result<Arc<dyn MistApp>, StartupError> {
     executor::run(async move {
         MistFactory::new(PathBuf::from(storage_directory), device_info)?
+            .create()
+            .await
+    })
+    .await
+    .map_err(|reason| StartupError::Executor { reason })?
+}
+
+/// Creates the default persistent runtime with a media command handler.
+///
+/// Android pushes local playback state through [`Media::publish_local`] and
+/// receives transport commands through `handler`. Linux uses
+/// [`MistFactory::media`] with a native MPRIS provider instead.
+///
+/// # Errors
+///
+/// Returns an error when the native executor, persistent state, or Iroh endpoint
+/// cannot initialize.
+#[uniffi::export]
+pub async fn create_mist_app_with_media(
+    storage_directory: String,
+    device_info: DeviceInfo,
+    handler: Box<dyn MediaCommandHandler>,
+) -> Result<Arc<dyn MistApp>, StartupError> {
+    let handler: Arc<dyn MediaCommandHandler> = Arc::from(handler);
+    executor::run(async move {
+        MistFactory::new(PathBuf::from(storage_directory), device_info)?
+            .media_command_handler(handler)
             .create()
             .await
     })

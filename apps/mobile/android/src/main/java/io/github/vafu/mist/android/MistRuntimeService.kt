@@ -16,6 +16,8 @@ import io.github.vafu.mist.core.Clipboard
 import io.github.vafu.mist.core.DeviceClass
 import io.github.vafu.mist.core.DeviceInfo
 import io.github.vafu.mist.core.DeviceManager
+import io.github.vafu.mist.core.Media
+import io.github.vafu.mist.core.MediaCommandHandler
 import io.github.vafu.mist.core.MistApp
 import io.github.vafu.mist.core.Notification
 import io.github.vafu.mist.core.NotificationKind
@@ -23,7 +25,7 @@ import io.github.vafu.mist.core.NotificationChannel as MistNotificationChannel
 import io.github.vafu.mist.core.Pairing
 import io.github.vafu.mist.core.PairingOffer
 import io.github.vafu.mist.core.Platform
-import io.github.vafu.mist.host.createMistApp
+import io.github.vafu.mist.host.createMistAppWithMedia
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,6 +47,20 @@ public class MistRuntimeService : Service() {
     private var pairing: Pairing? = null
     private var notifications: MistNotificationChannel? = null
     private var clipboard: Clipboard? = null
+    private var media: Media? = null
+    private var androidMedia: AndroidMedia? = null
+
+    private val mediaHandler: MediaCommandHandler = object : MediaCommandHandler {
+        override fun command(
+            playerId: String,
+            command: io.github.vafu.mist.core.MediaCommand,
+        ) {
+            runBlocking(Dispatchers.Default) {
+                runCatching { androidMedia?.command(playerId, command) }
+                    .onFailure { Log.e(TAG, "media command failed", it) }
+            }
+        }
+    }
 
     private val binder: IMistService.Stub = object : IMistService.Stub() {
         override fun snapshot(): Bundle = Bundle(currentSnapshot)
@@ -219,13 +235,14 @@ public class MistRuntimeService : Service() {
 
     private suspend fun startRuntime() {
         runCatching {
-            createMistApp(
+            createMistAppWithMedia(
                 filesDir.resolve("mist").absolutePath,
                 DeviceInfo(
                     displayName = Build.MODEL,
                     deviceClass = DeviceClass.PHONE,
                     platform = Platform.ANDROID,
                 ),
+                mediaHandler,
             )
         }.onSuccess { runtime ->
             app = runtime
@@ -233,11 +250,13 @@ public class MistRuntimeService : Service() {
             pairing = runtime.pairing()
             notifications = runtime.notificationChannel()
             clipboard = runtime.clipboard()
+            media = runtime.media()
             runtimeReady.complete(clipboard)
             publishSnapshot()
             scope.launch { forwardDeviceEvents() }
             scope.launch { receiveRemoteNotifications() }
             scope.launch { receiveClipboard() }
+            androidMedia = AndroidMedia(this@MistRuntimeService).also { it.start() }
         }.onFailure { error ->
             Log.e(TAG, "Mist runtime failed to start", error)
             runtimeReady.complete(null)
@@ -341,6 +360,32 @@ public class MistRuntimeService : Service() {
         }
     }
 
+    /** Called by [AndroidMedia] whenever platform playback state changes. */
+    internal fun onLocalMediaChanged(players: List<LocalMediaPlayer>) {
+        val media = media ?: return
+        runCatching {
+            media.publishLocal(
+                players.map { player ->
+                    io.github.vafu.mist.core.MediaPlayer(
+                        id = player.id,
+                        endpointId = "",
+                        name = player.name,
+                        device = DeviceInfo(
+                            displayName = Build.MODEL,
+                            deviceClass = DeviceClass.PHONE,
+                            platform = Platform.ANDROID,
+                        ),
+                        origin = io.github.vafu.mist.core.MediaOrigin.LOCAL,
+                        status = player.status,
+                        metadata = player.metadata,
+                        capabilities = player.capabilities,
+                        positionMs = player.positionMs,
+                    )
+                },
+            )
+        }.onFailure { Log.e(TAG, "Could not publish local media", it) }
+    }
+
     private fun publishSnapshot() {
         val runtime = app ?: return
         val manager = devices ?: return
@@ -384,6 +429,8 @@ public class MistRuntimeService : Service() {
     private fun requireClipboard(): Clipboard =
         clipboard ?: error("Mist runtime is not ready")
 
+    private fun requireMedia(): Media = media ?: error("Mist runtime is not ready")
+
     private fun createNotificationChannels() {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
@@ -418,6 +465,8 @@ public class MistRuntimeService : Service() {
             .build()
 
     private fun closeRuntimeHandles() {
+        androidMedia?.stop()
+        media?.close()
         clipboard?.close()
         notifications?.close()
         pairing?.close()

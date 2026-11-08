@@ -96,6 +96,7 @@ pub(crate) struct Session {
     reconnecting: StdMutex<std::collections::HashSet<EndpointId>>,
     media: MediaRegistry,
     media_provider: StdMutex<Option<Arc<dyn MediaProvider>>>,
+    media_command_handler: StdMutex<Option<Arc<dyn crate::MediaCommandHandler>>>,
     executor: Handle,
 }
 
@@ -127,6 +128,7 @@ impl Session {
             reconnecting: StdMutex::new(std::collections::HashSet::new()),
             media: MediaRegistry::new(device_info.clone()),
             media_provider: StdMutex::new(None),
+            media_command_handler: StdMutex::new(None),
             executor: Handle::current(),
         }))
     }
@@ -216,6 +218,36 @@ impl Session {
                 let _ = stream.finish();
             }
         });
+    }
+
+    /// Records app-provided local players and broadcasts them to peers.
+    pub(crate) fn publish_local_media(self: &Arc<Self>, players: Vec<MediaPlayer>) {
+        let local = players
+            .into_iter()
+            .filter(|player| player.origin == crate::MediaOrigin::Local)
+            .map(|player| crate::media::LocalPlayer {
+                id: player.id,
+                name: player.name,
+                status: player.status,
+                metadata: player.metadata,
+                commands: player.capabilities.commands,
+                position_ms: player.position_ms,
+            })
+            .collect::<Vec<_>>();
+        self.media.set_local(&local);
+        self.publish_media_snapshot();
+    }
+
+    /// Registers a platform handler for inbound commands. Used by hosts that
+    /// expose the runtime through generated bindings instead of a Rust provider.
+    pub fn set_media_command_handler(
+        self: &Arc<Self>,
+        handler: Arc<dyn crate::MediaCommandHandler>,
+    ) {
+        *self
+            .media_command_handler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(handler);
     }
 
     /// Broadcasts the local player snapshot to every connected peer.
@@ -558,6 +590,15 @@ impl Session {
             .clone();
         if let Some(provider) = provider {
             let _ = provider.command(&player_id, command).await;
+            return;
+        }
+        let handler = self
+            .media_command_handler
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(handler) = handler {
+            let _ = handler.command(player_id, command);
         }
     }
 
@@ -1008,6 +1049,14 @@ impl MistRuntime {
     /// Attaches the platform media backend.
     pub fn attach_media(self: &Arc<Self>, provider: &Arc<dyn MediaProvider>) {
         self.session.attach_media(provider);
+    }
+
+    /// Registers the platform command handler used by generated bindings.
+    pub fn set_media_command_handler(
+        self: &Arc<Self>,
+        handler: Arc<dyn crate::MediaCommandHandler>,
+    ) {
+        self.session.set_media_command_handler(handler);
     }
 
     async fn shutdown_runtime(&self) {

@@ -118,6 +118,17 @@ pub trait MediaEventStream: Send + Sync + Debug {
     async fn next(&self) -> Result<MediaEvent, MediaError>;
 }
 
+/// Platform callback for transport commands addressed to local players.
+#[uniffi::export(callback_interface)]
+pub trait MediaCommandHandler: Send + Sync + Debug {
+    /// Applies `command` to the local player identified by `player_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the player is unknown or rejects the command.
+    fn command(&self, player_id: String, command: MediaCommand) -> Result<(), MediaError>;
+}
+
 /// Media players visible to this runtime, local and remote.
 #[uniffi::export]
 #[async_trait]
@@ -129,5 +140,20 @@ pub trait Media: Send + Sync + Debug {
     fn subscribe(&self) -> Arc<dyn MediaEventStream>;
 
     /// Sends a transport command to a remote player.
+    /// Sends a transport command to a remote player.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the player is unknown or the transport fails.
     async fn command(&self, player_id: String, command: MediaCommand) -> Result<(), MediaError>;
+
+    /// Publishes this device's local player snapshot.
+    ///
+    /// Apps call this whenever platform playback state changes. It is the only
+    /// way local players enter the shared runtime; peers receive the snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the snapshot cannot be recorded.
+    fn publish_local(&self, players: Vec<MediaPlayer>) -> Result<(), MediaError>;
 }

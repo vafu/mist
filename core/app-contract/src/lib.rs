@@ -20,8 +20,8 @@ pub use device::{
     DeviceEventStream, DeviceInfo, DeviceManager, DeviceStatus, ManagedDevice, Platform,
 };
 pub use media::{
-    Media, MediaCapabilities, MediaCommand, MediaError, MediaEvent, MediaEventKind,
-    MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
+    Media, MediaCapabilities, MediaCommand, MediaCommandHandler, MediaError, MediaEvent,
+    MediaEventKind, MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
 };
 pub use notification::{
     Notification, NotificationChannel, NotificationError, NotificationEventStream,
