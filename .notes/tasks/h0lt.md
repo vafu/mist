@@ -48,7 +48,12 @@ Android (`:mist` service):
   activates the `Mist` MediaSession with `Test Track` / `Test Artist`.
 - Media notification posted on channel `mist_media`, `category=transport`, with
   Previous/Play/Next actions as real `PendingIntent`s.
-- Media card renders in the notification shade showing the remote track.
+- Media card renders in the notification shade showing the remote track
+  (`Test Track` / `Test Artist`, Previous / Pause / Next).
+- On the physical Pixel 10 Pro (build `382b155`): the `Mist` MediaSession is
+  active with `state=PLAYING` and correct metadata, and the `mist_media`
+  notification is posted with `template=android.app.Notification$MediaStyle`,
+  `category=transport`, `ONGOING`, and 3 real PendingIntent actions.
 - Core tests: remote visibility, command delivery to the owning provider, Added
   events, protocol round trip, invalid player rejection.
 
@@ -59,9 +64,11 @@ Android (`:mist` service):
 
 ## Known gaps
 
-- On-device verification of pressing the notification/Bluetooth buttons was
-  blocked by the emulator's flaky relay link (`active=false` between commands)
-  and by the non-exported service rejecting `adb shell` calls. The dispatch path
-  is implemented but was not observed end to end from a button press.
+- A button press was not observed end to end. `adb shell` cannot drive the
+  non-exported service, `cmd media_session dispatch` targets the media-button
+  session (SoundCloud/telecom own it), and tapping shade coordinates while adb
+  drives the device proved unreliable. Android also promotes the most recently
+  active session, so the Mist card is not always the visible one. The dispatch
+  path is implemented and each link is verified separately.
 - Artwork is a URL only; no transfer.
 - No per-device media enable/disable policy.
