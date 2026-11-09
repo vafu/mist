@@ -285,14 +285,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Arc::clone(&runtime),
         Arc::clone(&action_origins),
     ));
-    let mut notification_actions = tokio::spawn(forward_notification_actions(
-        Connection::session().await?,
-        Arc::clone(&runtime),
-        Arc::clone(&action_origins),
-    ));
     let mut monitored_notifications = tokio::spawn(monitor_desktop_notifications(
         connection.clone(),
         Arc::clone(&runtime),
+        Arc::clone(&action_origins),
     ));
     let local_clipboard: Arc<dyn LocalClipboardProvider> =
         Arc::new(WaylandClipboard::new(state_directory()?.join("clipboard")));
@@ -317,7 +313,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         result = &mut device_events => result??,
         result = &mut incoming_notifications => result??,
         result = &mut monitored_notifications => result??,
-        result = &mut notification_actions => result??,
         result = &mut incoming_clipboard => result??,
         result = &mut local_clipboard_changes => result??,
         result = &mut published_media => result??,
@@ -326,7 +321,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     device_events.abort();
     incoming_notifications.abort();
     monitored_notifications.abort();
-    notification_actions.abort();
     incoming_clipboard.abort();
     local_clipboard_changes.abort();
     published_media.abort();
@@ -406,48 +400,6 @@ async fn forward_incoming_notifications(
             )
             .await?;
     }
-}
-
-/// Sends actions activated on desktop notifications back to their origin.
-async fn forward_notification_actions(
-    monitor: Connection,
-    runtime: Arc<dyn MistApp>,
-    origins: ActionOrigins,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let rules = ["type='signal',interface='org.freedesktop.Notifications',member='ActionInvoked'"];
-    monitor
-        .call_method(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            Some("org.freedesktop.DBus.Monitoring"),
-            "BecomeMonitor",
-            &(&rules[..], 0_u32),
-        )
-        .await?;
-
-    let mut messages = MessageStream::from(monitor);
-    while let Some(message) = messages.next().await {
-        let message = message?;
-        let Ok((desktop_id, key)) = message.body().deserialize::<(u32, String)>() else {
-            continue;
-        };
-        let Some((endpoint_id, notification_id, actions)) =
-            origins.lock().await.get(&desktop_id).cloned()
-        else {
-            continue;
-        };
-        if !actions.contains(&key) {
-            continue;
-        }
-        if let Err(error) = runtime
-            .notification_channel()
-            .activate(endpoint_id, notification_id, key)
-            .await
-        {
-            eprintln!("mistd: could not deliver notification action: {error}");
-        }
-    }
-    Ok(())
 }
 
 /// Resolves an `image-path` style hint (URI or file path) into a local image.
@@ -535,6 +487,32 @@ fn percent_decode(value: &str) -> String {
     out
 }
 
+/// Routes a desktop `ActionInvoked` signal back to the owning device.
+async fn handle_action_invoked(
+    runtime: &Arc<dyn MistApp>,
+    action_origins: &ActionOrigins,
+    message: &zbus::Message,
+) {
+    let Ok((desktop_id, key)) = message.body().deserialize::<(u32, String)>() else {
+        return;
+    };
+    let Some((endpoint_id, notification_id, actions)) =
+        action_origins.lock().await.get(&desktop_id).cloned()
+    else {
+        return;
+    };
+    if !actions.contains(&key) {
+        return;
+    }
+    if let Err(error) = runtime
+        .notification_channel()
+        .activate(endpoint_id, notification_id, key)
+        .await
+    {
+        eprintln!("mistd: could not deliver notification action: {error}");
+    }
+}
+
 async fn show_desktop_notification(
     connection: &Connection,
     device_name: &str,
@@ -586,13 +564,19 @@ async fn show_desktop_notification(
         .deserialize::<u32>()
 }
 
+/// Watches desktop notifications and their action activations.
+///
+/// D-Bus allows one monitor per connection, so a single connection carries both
+/// rules and dispatches on the member name.
 async fn monitor_desktop_notifications(
     daemon_connection: Connection,
     runtime: Arc<dyn MistApp>,
+    action_origins: ActionOrigins,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let monitor = Connection::session().await?;
     let rules = [
         "type='method_call',path='/org/freedesktop/Notifications',interface='org.freedesktop.Notifications',member='Notify'",
+        "type='signal',interface='org.freedesktop.Notifications',member='ActionInvoked'",
     ];
     monitor
         .call_method(
@@ -616,6 +600,14 @@ async fn monitor_desktop_notifications(
             .sender()
             .is_some_and(|sender| sender.as_str() == daemon_name)
         {
+            continue;
+        }
+        if message
+            .header()
+            .member()
+            .is_some_and(|member| member.as_str() == "ActionInvoked")
+        {
+            handle_action_invoked(&runtime, &action_origins, &message).await;
             continue;
         }
         let Ok((application, _, app_icon, title, body, raw_actions, hints, _)) =

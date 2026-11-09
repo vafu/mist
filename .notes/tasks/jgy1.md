@@ -57,6 +57,29 @@ Core, with two paired runtimes:
 Checks: `cargo test --workspace` (11 binaries), strict Clippy, fmt, and
 `./gradlew check :android:assembleDebug`.
 
+## Regression fixed
+
+The first implementation spawned a *second* D-Bus monitor connection for
+`ActionInvoked`. That did not break monitoring (D-Bus allows several monitors),
+but it did leave desktop `Notify` forwarding silently dead in testing: the
+daemon restarted repeatedly while the Pixel link was down, and forwarding
+legitimately had nowhere to send.
+
+The two monitors are now merged into one connection carrying both rules, which
+removes the ordering hazard and the duplicate setup. Desktop `Notify` forwarding
+was re-verified after the change.
+
+## Verified on device
+
+Linux -> Pixel: `Notify` with `reply`/`dismiss` actions was forwarded; the daemon
+logged the message and forwarded it while connected.
+
+Not completed: tapping the action on the Pixel and observing the activation
+arrive back on Linux. The Pixel's Iroh link dropped repeatedly during the
+session (`connected: false` immediately after a successful `connect`), and it
+also turned out the `:mist` process had been stopped, which is why the first
+attempts silently went nowhere.
+
 ## Not yet verified on device
 
 The Pixel dropped off ADB before I could tap a rendered action and observe it
