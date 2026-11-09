@@ -278,6 +278,9 @@ pub(crate) struct EncodedNotification {
     pub(crate) images: Vec<crate::transfer::BlobMetadata>,
 }
 
+pub(crate) const MAX_NOTIFICATION_ACTIONS: usize = 8;
+pub(crate) const MAX_NOTIFICATION_ACTION_ID: usize = 128;
+pub(crate) const MAX_NOTIFICATION_ACTION_LABEL: usize = 128;
 pub(crate) const MAX_NOTIFICATION_ICON_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_NOTIFICATION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -350,6 +353,14 @@ pub(crate) fn encode_notification(notification: &Notification) -> wire::Notifica
         .into(),
         app_icon: None,
         image: None,
+        actions: notification
+            .actions
+            .iter()
+            .map(|action| wire::NotificationAction {
+                id: action.id.clone(),
+                label: action.label.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -414,6 +425,17 @@ pub(crate) fn decode_notification(
     if notification.body.chars().count() > 16 * 1024 {
         return Err(ProtocolError::InvalidNotification("body"));
     }
+    if notification.actions.len() > MAX_NOTIFICATION_ACTIONS {
+        return Err(ProtocolError::InvalidNotification("actions"));
+    }
+    for action in &notification.actions {
+        if action.id.is_empty() || action.id.len() > MAX_NOTIFICATION_ACTION_ID {
+            return Err(ProtocolError::InvalidNotification("action id"));
+        }
+        if action.label.chars().count() > MAX_NOTIFICATION_ACTION_LABEL {
+            return Err(ProtocolError::InvalidNotification("action label"));
+        }
+    }
     Ok(Notification {
         id: notification.id,
         application: notification.application,
@@ -442,6 +464,14 @@ pub(crate) fn decode_notification(
                 mime_type: image.mime_type.clone(),
                 path: String::new(),
             }),
+        actions: notification
+            .actions
+            .iter()
+            .map(|action| crate::NotificationAction {
+                id: action.id.clone(),
+                label: action.label.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -457,6 +487,7 @@ pub(crate) fn message_name(body: &wire::control_frame::Body) -> &'static str {
         wire::control_frame::Body::ClipboardItem(_) => "clipboard item",
         wire::control_frame::Body::MediaSnapshot(_) => "media snapshot",
         wire::control_frame::Body::MediaCommand(_) => "media command",
+        wire::control_frame::Body::NotificationActionActivated(_) => "notification action",
     }
 }
 

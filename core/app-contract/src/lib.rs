@@ -24,8 +24,9 @@ pub use media::{
     MediaEventKind, MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
 };
 pub use notification::{
-    Notification, NotificationChannel, NotificationError, NotificationEventStream,
-    NotificationImage, NotificationKind, ReceivedNotification,
+    ActivatedNotificationAction, Notification, NotificationAction, NotificationActivationStream,
+    NotificationChannel, NotificationError, NotificationEventStream, NotificationImage,
+    NotificationKind, ReceivedNotification,
 };
 pub use pairing::{PairedPeer, Pairing, PairingError, PairingOffer};
 

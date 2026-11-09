@@ -148,6 +148,20 @@ public class MistRuntimeService : Service() {
             }
         }
 
+        override fun activateNotification(
+            sourceEndpointId: String,
+            notificationId: String,
+            actionId: String,
+            callback: IMistResultCallback,
+        ) {
+            runOperation(callback) {
+                runBlocking(Dispatchers.Default) {
+                    requireNotifications().activate(sourceEndpointId, notificationId, actionId)
+                }
+                Bundle.EMPTY
+            }
+        }
+
         override fun pushNotification(notification: Bundle) {
             scope.launch {
                 runCatching {
@@ -178,6 +192,18 @@ public class MistRuntimeService : Service() {
         if (intent?.action == MistServiceStarter.ACTION_MEDIA_COMMAND) {
             val command = intent.getStringExtra(MistServiceStarter.EXTRA_MEDIA_COMMAND)
             dispatchMediaCommand(command)
+        }
+        if (intent?.action == MistServiceStarter.ACTION_NOTIFICATION_ACTION) {
+            val endpoint = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ENDPOINT)
+            val notificationId = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ID)
+            val actionId = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ACTION)
+            if (endpoint != null && notificationId != null && actionId != null) {
+                scope.launch {
+                    runCatching {
+                        requireNotifications().activate(endpoint, notificationId, actionId)
+                    }.onFailure { Log.e(TAG, "could not activate notification action", it) }
+                }
+            }
         }
         return START_STICKY
     }
@@ -270,6 +296,7 @@ public class MistRuntimeService : Service() {
                 }
             }.also { it.start() }
             scope.launch { forwardMediaEvents() }
+            scope.launch { forwardNotificationActions() }
         }.onFailure { error ->
             Log.e(TAG, "Mist runtime failed to start", error)
             runtimeReady.complete(null)
@@ -317,6 +344,19 @@ public class MistRuntimeService : Service() {
                     builder.setLargeIcon(image)
                     builder.setStyle(
                         android.app.Notification.BigPictureStyle().bigPicture(image),
+                    )
+                }
+                for (action in received.notification.actions) {
+                    builder.addAction(
+                        android.app.Notification.Action.Builder(
+                            null,
+                            action.label,
+                            notificationActionIntent(
+                                received.sourceEndpointId,
+                                received.notification.id,
+                                action.id,
+                            ),
+                        ).build(),
                     )
                 }
                 val notification = builder.build()
@@ -381,6 +421,53 @@ public class MistRuntimeService : Service() {
             }
         } finally {
             callbacks.finishBroadcast()
+        }
+    }
+
+    private fun notificationActionIntent(
+        sourceEndpointId: String,
+        notificationId: String,
+        actionId: String,
+    ): android.app.PendingIntent {
+        val intent = Intent(this, MistRuntimeService::class.java).apply {
+            action = MistServiceStarter.ACTION_NOTIFICATION_ACTION
+            putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ENDPOINT, sourceEndpointId)
+            putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ID, notificationId)
+            putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ACTION, actionId)
+        }
+        return android.app.PendingIntent.getService(
+            this,
+            actionId.hashCode(),
+            intent,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /** Relays actions activated by peers back to the app that owns them. */
+    private suspend fun forwardNotificationActions() {
+        val notifications = notifications ?: return
+        val stream = notifications.subscribeActivations()
+        try {
+            while (true) {
+                val activation = stream.next()
+                val bundle = Bundle().apply {
+                    putString(KEY_ACTIVATION_ENDPOINT, activation.sourceEndpointId)
+                    putString(KEY_ACTIVATION_NOTIFICATION, activation.notificationId)
+                    putString(KEY_ACTIVATION_ACTION, activation.actionId)
+                }
+                val count = callbacks.beginBroadcast()
+                try {
+                    repeat(count) { index ->
+                        runCatching {
+                            callbacks.getBroadcastItem(index).onNotificationAction(bundle)
+                        }
+                    }
+                } finally {
+                    callbacks.finishBroadcast()
+                }
+            }
+        } finally {
+            stream.close()
         }
     }
 
@@ -554,9 +641,13 @@ internal const val KEY_TIMESTAMP_MS: String = "timestamp_ms"
 internal const val KEY_SILENT: String = "silent"
 internal const val KEY_NOTIFICATION_KIND: String = "notification_kind"
 internal const val KEY_APP_ICON: String = "notification_app_icon"
+internal const val KEY_ACTIONS: String = "notification_actions"
 internal const val KEY_IMAGE: String = "notification_image"
 internal const val KEY_IMAGE_MIME_TYPE: String = "image_mime_type"
 internal const val KEY_IMAGE_PATH: String = "image_path"
+internal const val KEY_ACTIVATION_ENDPOINT: String = "activation_endpoint"
+internal const val KEY_ACTIVATION_NOTIFICATION: String = "activation_notification"
+internal const val KEY_ACTIVATION_ACTION: String = "activation_action"
 internal const val KEY_CLIPBOARD_KIND: String = "clipboard_kind"
 internal const val KEY_CLIPBOARD_TEXT: String = "clipboard_text"
 internal const val KEY_CLIPBOARD_MIME_TYPE: String = "clipboard_mime_type"
@@ -598,6 +689,7 @@ internal fun Notification.toBundle(): Bundle = Bundle().apply {
     putLong(KEY_TIMESTAMP_MS, timestampMs)
     putBoolean(KEY_SILENT, silent)
     putString(KEY_NOTIFICATION_KIND, kind.name)
+    putStringArrayList(KEY_ACTIONS, ArrayList(actions.map { "${it.id}\u0000${it.label}" }))
     appIcon?.let { putBundle(KEY_APP_ICON, it.toBundle()) }
     image?.let { putBundle(KEY_IMAGE, it.toBundle()) }
 }
@@ -624,6 +716,10 @@ private fun Bundle.toMistNotification(): Notification = Notification(
     timestampMs = getLong(KEY_TIMESTAMP_MS),
     silent = getBoolean(KEY_SILENT),
     kind = NotificationKind.valueOf(getString(KEY_NOTIFICATION_KIND).orEmpty()),
+    actions = getStringArrayList(KEY_ACTIONS).orEmpty().mapNotNull {
+        val parts = it.split('\u0000', limit = 2)
+        if (parts.size == 2) io.github.vafu.mist.core.NotificationAction(parts[0], parts[1]) else null
+    },
     appIcon = getBundle(KEY_APP_ICON)?.toNotificationImage(),
     image = getBundle(KEY_IMAGE)?.toNotificationImage(),
 )

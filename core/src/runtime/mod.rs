@@ -28,7 +28,10 @@ use crate::device::RuntimeDeviceManager;
 use crate::media::{IrohMedia, MediaProvider, MediaRegistry};
 use crate::notification::IrohNotificationChannel;
 use crate::pairing::IrohPairing;
-use crate::protocol::wire::{ControlFrame, PairingAuthenticate, control_frame};
+use crate::protocol::wire::{
+    ControlFrame, NotificationActionActivated as WireActionActivated, PairingAuthenticate,
+    control_frame,
+};
 use crate::protocol::{
     ClipboardMetadata, address_snapshot, decode_address_snapshot, decode_clipboard_item,
     decode_media_command, decode_media_snapshot, decode_notification_with_images,
@@ -45,6 +48,9 @@ use crate::{
 };
 
 pub(crate) use builder::MistBuilder;
+
+/// How many sent notifications keep their action list for validation.
+const MAX_TRACKED_NOTIFICATIONS: usize = 256;
 
 /// Failure while constructing or connecting a Mist runtime.
 #[derive(Debug, Error)]
@@ -89,6 +95,8 @@ pub(crate) struct Session {
     address_revisions: StdMutex<std::collections::HashMap<(EndpointId, u64), u64>>,
     notifications: broadcast::Sender<ReceivedNotification>,
     clipboard: broadcast::Sender<ReceivedClipboard>,
+    activations: broadcast::Sender<crate::ActivatedNotificationAction>,
+    sent_notifications: StdMutex<std::collections::HashMap<String, Vec<String>>>,
     blob_directory: std::path::PathBuf,
     pairing_attempts_tx: mpsc::Sender<IncomingPairingAttempt>,
     pairing_attempts_rx: Arc<Mutex<mpsc::Receiver<IncomingPairingAttempt>>>,
@@ -110,6 +118,7 @@ impl Session {
     ) -> Result<Arc<Self>, StoreError> {
         let (notifications, _) = broadcast::channel(256);
         let (clipboard, _) = broadcast::channel(64);
+        let (activations, _) = broadcast::channel(64);
         let (pairing_attempts_tx, pairing_attempts_rx) = mpsc::channel(32);
         let devices = DeviceRegistry::new(store.load_devices()?);
         Ok(Arc::new(Self {
@@ -121,6 +130,8 @@ impl Session {
             address_revisions: StdMutex::new(std::collections::HashMap::new()),
             notifications,
             clipboard,
+            activations,
+            sent_notifications: StdMutex::new(std::collections::HashMap::new()),
             blob_directory,
             pairing_attempts_tx,
             pairing_attempts_rx: Arc::new(Mutex::new(pairing_attempts_rx)),
@@ -169,6 +180,102 @@ impl Session {
 
     pub(crate) fn subscribe_clipboard(&self) -> broadcast::Receiver<ReceivedClipboard> {
         self.clipboard.subscribe()
+    }
+
+    pub(crate) fn subscribe_activations(
+        &self,
+    ) -> broadcast::Receiver<crate::ActivatedNotificationAction> {
+        self.activations.subscribe()
+    }
+
+    /// Remembers the actions of a notification this device sent, so an
+    /// activation from a peer can be validated and routed to the local app.
+    fn remember_sent_notification(&self, notification: &Notification) {
+        if notification.actions.is_empty() {
+            return;
+        }
+        let mut sent = self
+            .sent_notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if sent.len() >= MAX_TRACKED_NOTIFICATIONS {
+            sent.clear();
+        }
+        sent.insert(
+            notification.id.clone(),
+            notification
+                .actions
+                .iter()
+                .map(|action| action.id.clone())
+                .collect(),
+        );
+    }
+
+    /// Handles an action activated on a notification this device sent.
+    fn receive_notification_activation(&self, endpoint_id: EndpointId, wire: WireActionActivated) {
+        let Some(actions) = self
+            .sent_notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&wire.notification_id)
+            .cloned()
+        else {
+            return;
+        };
+        if !actions.contains(&wire.action_id) {
+            return;
+        }
+        let _ = self.activations.send(crate::ActivatedNotificationAction {
+            source_endpoint_id: endpoint_id.to_string(),
+            notification_id: wire.notification_id,
+            action_id: wire.action_id,
+        });
+    }
+
+    /// Sends an activated action back to the device that owns the notification.
+    pub(crate) async fn activate_notification(
+        self: &Arc<Self>,
+        endpoint_id: EndpointId,
+        notification_id: String,
+        action_id: String,
+    ) -> Result<(), NotificationError> {
+        if !self.devices.contains(endpoint_id) {
+            return Err(NotificationError::UnknownDevice {
+                endpoint_id: endpoint_id.to_string(),
+            });
+        }
+        let connection = self.devices.connection(endpoint_id).ok_or_else(|| {
+            NotificationError::Disconnected {
+                endpoint_id: endpoint_id.to_string(),
+            }
+        })?;
+        let mut stream =
+            connection
+                .open_uni()
+                .await
+                .map_err(|error| NotificationError::Transport {
+                    reason: error.to_string(),
+                })?;
+        write_control_frame(
+            &mut stream,
+            &ControlFrame {
+                body: Some(control_frame::Body::NotificationActionActivated(
+                    WireActionActivated {
+                        notification_id,
+                        action_id,
+                    },
+                )),
+            },
+        )
+        .await
+        .map_err(|error| NotificationError::Transport {
+            reason: error.to_string(),
+        })?;
+        stream
+            .finish()
+            .map_err(|error| NotificationError::Transport {
+                reason: error.to_string(),
+            })
     }
 
     pub(crate) fn subscribe_media(&self) -> broadcast::Receiver<MediaEvent> {
@@ -541,6 +648,9 @@ impl Session {
                     sha256: hex(&sha256),
                 });
             }
+            Some(control_frame::Body::NotificationActionActivated(wire)) => {
+                self.receive_notification_activation(endpoint_id, wire);
+            }
             Some(control_frame::Body::MediaSnapshot(snapshot)) => {
                 self.receive_media_snapshot(endpoint_id, snapshot);
             }
@@ -846,6 +956,7 @@ impl Session {
             TargetError::NoSelected => NotificationError::NoSelectedDevices,
         })?;
 
+        self.remember_sent_notification(notification);
         crate::protocol::validate_notification_images(notification).map_err(|error| {
             NotificationError::Transport {
                 reason: error.to_string(),

@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_util::StreamExt;
 use mist_app_contract::{
     ClipboardContent, ConnectionTransport, DeviceClass, DeviceInfo, DeviceStatus, ManagedDevice,
-    MediaCommand, MistApp, Notification, NotificationImage, NotificationKind, Platform,
+    MediaCommand, MistApp, Notification, NotificationAction, NotificationImage, NotificationKind,
+    Platform,
 };
 use mist_core::host::MistFactory;
 use mist_linux::clipboard::{LocalClipboardProvider, WaylandClipboard};
@@ -208,6 +209,7 @@ impl MistDbus {
                     kind: NotificationKind::Message,
                     app_icon: None,
                     image,
+                    actions: Vec::new(),
                 },
                 Vec::new(),
             )
@@ -277,9 +279,16 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         connection.clone(),
         Arc::clone(&runtime),
     ));
+    let action_origins: ActionOrigins = Arc::new(Mutex::new(HashMap::new()));
     let mut incoming_notifications = tokio::spawn(forward_incoming_notifications(
         connection.clone(),
         Arc::clone(&runtime),
+        Arc::clone(&action_origins),
+    ));
+    let mut notification_actions = tokio::spawn(forward_notification_actions(
+        Connection::session().await?,
+        Arc::clone(&runtime),
+        Arc::clone(&action_origins),
     ));
     let mut monitored_notifications = tokio::spawn(monitor_desktop_notifications(
         connection.clone(),
@@ -308,6 +317,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         result = &mut device_events => result??,
         result = &mut incoming_notifications => result??,
         result = &mut monitored_notifications => result??,
+        result = &mut notification_actions => result??,
         result = &mut incoming_clipboard => result??,
         result = &mut local_clipboard_changes => result??,
         result = &mut published_media => result??,
@@ -316,6 +326,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     device_events.abort();
     incoming_notifications.abort();
     monitored_notifications.abort();
+    notification_actions.abort();
     incoming_clipboard.abort();
     local_clipboard_changes.abort();
     published_media.abort();
@@ -342,19 +353,46 @@ async fn forward_device_events(
     }
 }
 
+/// Maps a desktop notification id back to the device and notification that
+/// produced it, so `ActionInvoked` can be routed home.
+type ActionOrigins = Arc<Mutex<HashMap<u32, (String, String, Vec<String>)>>>;
+
+/// How many desktop notifications keep their action mapping.
+const MAX_TRACKED_DESKTOP_NOTIFICATIONS: usize = 256;
+
 async fn forward_incoming_notifications(
     connection: Connection,
     runtime: Arc<dyn MistApp>,
+    origins: ActionOrigins,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let notifications = runtime.notification_channel().subscribe();
     loop {
         let received = notifications.next().await?;
-        show_desktop_notification(
+        let desktop_id = show_desktop_notification(
             &connection,
             &received.source_device.display_name,
             &received.notification,
         )
         .await?;
+        if !received.notification.actions.is_empty() {
+            let mut origins = origins.lock().await;
+            if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
+                origins.clear();
+            }
+            origins.insert(
+                desktop_id,
+                (
+                    received.source_endpoint_id.clone(),
+                    received.notification.id.clone(),
+                    received
+                        .notification
+                        .actions
+                        .iter()
+                        .map(|action| action.id.clone())
+                        .collect(),
+                ),
+            );
+        }
         let interface = connection
             .object_server()
             .interface::<_, MistDbus>(OBJECT_PATH)
@@ -368,6 +406,48 @@ async fn forward_incoming_notifications(
             )
             .await?;
     }
+}
+
+/// Sends actions activated on desktop notifications back to their origin.
+async fn forward_notification_actions(
+    monitor: Connection,
+    runtime: Arc<dyn MistApp>,
+    origins: ActionOrigins,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let rules = ["type='signal',interface='org.freedesktop.Notifications',member='ActionInvoked'"];
+    monitor
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus.Monitoring"),
+            "BecomeMonitor",
+            &(&rules[..], 0_u32),
+        )
+        .await?;
+
+    let mut messages = MessageStream::from(monitor);
+    while let Some(message) = messages.next().await {
+        let message = message?;
+        let Ok((desktop_id, key)) = message.body().deserialize::<(u32, String)>() else {
+            continue;
+        };
+        let Some((endpoint_id, notification_id, actions)) =
+            origins.lock().await.get(&desktop_id).cloned()
+        else {
+            continue;
+        };
+        if !actions.contains(&key) {
+            continue;
+        }
+        if let Err(error) = runtime
+            .notification_channel()
+            .activate(endpoint_id, notification_id, key)
+            .await
+        {
+            eprintln!("mistd: could not deliver notification action: {error}");
+        }
+    }
+    Ok(())
 }
 
 /// Resolves an `image-path` style hint (URI or file path) into a local image.
@@ -407,6 +487,21 @@ fn attach_image(path: &std::path::Path, small: bool) -> Option<NotificationImage
     })
 }
 
+/// Parses freedesktop action pairs into actions.
+///
+/// The wire format is a flat `[id, label, id, label, ...]` list. The synthetic
+/// `default` action is dropped because it represents a body click rather than a
+/// button.
+fn parse_notify_actions(raw: &[String]) -> Vec<NotificationAction> {
+    raw.chunks_exact(2)
+        .filter(|pair| pair[0] != "default")
+        .map(|pair| NotificationAction {
+            id: pair[0].clone(),
+            label: pair[1].clone(),
+        })
+        .collect()
+}
+
 fn guess_image_mime(path: &str) -> String {
     match std::path::Path::new(path)
         .extension()
@@ -444,8 +539,16 @@ async fn show_desktop_notification(
     connection: &Connection,
     device_name: &str,
     notification: &Notification,
-) -> zbus::Result<()> {
-    let actions: Vec<&str> = Vec::new();
+) -> zbus::Result<u32> {
+    let mut actions: Vec<&str> = Vec::with_capacity(notification.actions.len() * 2);
+    for action in &notification.actions {
+        actions.push(&action.id);
+        actions.push(&action.label);
+    }
+    if notification.actions.is_empty() {
+        actions.push("default");
+        actions.push("Open");
+    }
     let mut hints: HashMap<&str, OwnedValue> = HashMap::new();
     for path in [
         notification.app_icon.as_ref().map(|icon| &icon.path),
@@ -460,6 +563,7 @@ async fn show_desktop_notification(
             hints.insert("image-path", value);
         }
     }
+    let replaces_id = 0_u32;
     connection
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -468,7 +572,7 @@ async fn show_desktop_notification(
             "Notify",
             &(
                 format!("{} · {device_name}", notification.application),
-                0_u32,
+                replaces_id,
                 "dialog-information",
                 &notification.title,
                 &notification.body,
@@ -477,8 +581,9 @@ async fn show_desktop_notification(
                 -1_i32,
             ),
         )
-        .await?;
-    Ok(())
+        .await?
+        .body()
+        .deserialize::<u32>()
 }
 
 async fn monitor_desktop_notifications(
@@ -513,7 +618,7 @@ async fn monitor_desktop_notifications(
         {
             continue;
         }
-        let Ok((application, _, app_icon, title, body, _, hints, _)) =
+        let Ok((application, _, app_icon, title, body, raw_actions, hints, _)) =
             message.body().deserialize::<NotifyBody>()
         else {
             continue;
@@ -533,6 +638,7 @@ async fn monitor_desktop_notifications(
             kind: NotificationKind::Message,
             app_icon: icon,
             image,
+            actions: parse_notify_actions(&raw_actions),
         };
         if let Err(error) = runtime
             .notification_channel()

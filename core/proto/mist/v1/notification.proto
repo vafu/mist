@@ -15,6 +15,19 @@ message Notification {
   // Binary payloads follow the control frame on the same stream, in this order.
   NotificationImage app_icon = 8;
   NotificationImage image = 9;
+  repeated NotificationAction actions = 10;
+}
+
+// One actionable button, identified by a stable key.
+message NotificationAction {
+  string id = 1;
+  string label = 2;
+}
+
+// The user activated an action on a notification this device sent.
+message NotificationActionActivated {
+  string notification_id = 1;
+  string action_id = 2;
 }
 
 // Metadata for one notification image; bytes follow the control frame.

@@ -209,6 +209,7 @@ async fn notification_and_clipboard_streams_are_independent() {
                 kind: NotificationKind::Message,
                 app_icon: None,
                 image: None,
+                actions: Vec::new(),
             },
             Vec::new(),
         )
@@ -297,6 +298,7 @@ async fn notification_sent_while_disconnected_is_delivered_after_reconnect() {
                 kind: NotificationKind::Message,
                 app_icon: None,
                 image: None,
+                actions: Vec::new(),
             },
             vec![right_id],
         )
@@ -334,6 +336,7 @@ async fn media_notifications_are_not_forwarded_by_the_notification_bridge() {
                     kind,
                     app_icon: None,
                     image: None,
+                    actions: Vec::new(),
                 },
                 Vec::new(),
             )
@@ -393,6 +396,7 @@ async fn notification_images_cross_the_wire() {
                     mime_type: "image/png".to_owned(),
                     path: image_path.to_string_lossy().into_owned(),
                 }),
+                actions: Vec::new(),
             },
             Vec::new(),
         )
@@ -437,6 +441,7 @@ async fn oversized_notification_image_is_rejected() {
                     path: path.to_string_lossy().into_owned(),
                 }),
                 image: None,
+                actions: Vec::new(),
             },
             Vec::new(),
         )
@@ -474,6 +479,7 @@ async fn notification_image_path_is_populated_on_receive() {
                     mime_type: "image/png".to_owned(),
                     path: path.to_string_lossy().into_owned(),
                 }),
+                actions: Vec::new(),
             },
             Vec::new(),
         )
@@ -487,6 +493,94 @@ async fn notification_image_path_is_populated_on_receive() {
     let image = received.notification.image.expect("image present");
     assert!(!image.path.is_empty(), "received path must be populated");
     assert_eq!(image.mime_type, "image/png");
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
+async fn notification_actions_round_trip_to_the_owner() {
+    use mist_app_contract::NotificationAction;
+
+    let (_left_dir, _right_dir, left, right) = paired().await;
+    let incoming = right.notification_channel().subscribe();
+    let activations = left.notification_channel().subscribe_activations();
+
+    left.notification_channel()
+        .push(
+            Notification {
+                id: "actionable".to_owned(),
+                application: "Mist tests".to_owned(),
+                title: "Reply?".to_owned(),
+                body: "Pick one".to_owned(),
+                timestamp_ms: 7,
+                silent: true,
+                kind: NotificationKind::Message,
+                app_icon: None,
+                image: None,
+                actions: vec![
+                    NotificationAction {
+                        id: "reply".to_owned(),
+                        label: "Reply".to_owned(),
+                    },
+                    NotificationAction {
+                        id: "dismiss".to_owned(),
+                        label: "Dismiss".to_owned(),
+                    },
+                ],
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(5), incoming.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.notification.actions.len(), 2);
+    assert_eq!(received.notification.actions[1].id, "dismiss");
+    assert_eq!(received.notification.actions[1].label, "Dismiss");
+
+    right
+        .notification_channel()
+        .activate(
+            received.source_endpoint_id.clone(),
+            "actionable".to_owned(),
+            "dismiss".to_owned(),
+        )
+        .await
+        .unwrap();
+
+    let activated = tokio::time::timeout(Duration::from_secs(5), activations.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(activated.notification_id, "actionable");
+    assert_eq!(activated.action_id, "dismiss");
+    assert_eq!(activated.source_endpoint_id, right.endpoint_id());
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_notification_actions_are_ignored() {
+    let (_left_dir, _right_dir, left, right) = paired().await;
+    let activations = left.notification_channel().subscribe_activations();
+
+    right
+        .notification_channel()
+        .activate(left.endpoint_id(), "nope".to_owned(), "whatever".to_owned())
+        .await
+        .unwrap();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), activations.next())
+            .await
+            .is_err(),
+        "activation for an unknown notification must be dropped"
+    );
 
     left.shutdown().await;
     right.shutdown().await;

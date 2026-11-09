@@ -19,12 +19,12 @@ pub mod host;
 pub mod probe;
 
 pub(crate) use mist_app_contract::{
-    Clipboard, ClipboardContent, ClipboardError, ConnectionTransport, DeviceClass, DeviceError,
-    DeviceEvent, DeviceEventKind, DeviceInfo, DeviceManager, DeviceStatus, ManagedDevice, Media,
-    MediaCapabilities, MediaCommand, MediaCommandHandler, MediaError, MediaEvent, MediaMetadata,
-    MediaOrigin, MediaPlayer, MistApp, Notification, NotificationChannel, NotificationError,
-    NotificationImage, NotificationKind, Pairing, Platform, PlaybackStatus, ReceivedClipboard,
-    ReceivedNotification,
+    ActivatedNotificationAction, Clipboard, ClipboardContent, ClipboardError, ConnectionTransport,
+    DeviceClass, DeviceError, DeviceEvent, DeviceEventKind, DeviceInfo, DeviceManager,
+    DeviceStatus, ManagedDevice, Media, MediaCapabilities, MediaCommand, MediaCommandHandler,
+    MediaError, MediaEvent, MediaMetadata, MediaOrigin, MediaPlayer, MistApp, Notification,
+    NotificationAction, NotificationChannel, NotificationError, NotificationImage,
+    NotificationKind, Pairing, Platform, PlaybackStatus, ReceivedClipboard, ReceivedNotification,
 };
 
 /// Iroh application protocol negotiated by every Mist connection.

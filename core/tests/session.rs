@@ -109,6 +109,7 @@ async fn manages_multiple_devices_and_fans_out_notifications() {
                 kind: NotificationKind::Message,
                 app_icon: None,
                 image: None,
+                actions: Vec::new(),
             },
             Vec::new(),
         )

@@ -21,5 +21,6 @@ message ControlFrame {
     ClipboardItem clipboard_item = 8;
     MediaSnapshot media_snapshot = 9;
     MediaCommandRequest media_command = 10;
+    NotificationActionActivated notification_action_activated = 11;
   }
 }

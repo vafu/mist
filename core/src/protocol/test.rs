@@ -63,6 +63,7 @@ fn notification_round_trips_between_domain_and_wire_types() {
         kind: NotificationKind::Message,
         app_icon: None,
         image: None,
+        actions: Vec::new(),
     };
 
     let frame = ControlFrame {

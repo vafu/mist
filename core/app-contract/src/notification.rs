@@ -31,6 +31,15 @@ pub struct NotificationImage {
     pub path: String,
 }
 
+/// One actionable button attached to a notification.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct NotificationAction {
+    /// Stable action key, unique within its notification.
+    pub id: String,
+    /// User-visible button label.
+    pub label: String,
+}
+
 /// Platform-neutral notification exchanged between Mist devices.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct Notification {
@@ -45,6 +54,8 @@ pub struct Notification {
     pub app_icon: Option<NotificationImage>,
     /// Larger content image such as a photo or album art.
     pub image: Option<NotificationImage>,
+    /// Actionable buttons. Empty when the notification has no actions.
+    pub actions: Vec<NotificationAction>,
 }
 
 /// Notification received from an authenticated peer.
@@ -53,6 +64,17 @@ pub struct ReceivedNotification {
     pub source_endpoint_id: String,
     pub source_device: DeviceInfo,
     pub notification: Notification,
+}
+
+/// An action the user activated on a remote notification.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct ActivatedNotificationAction {
+    /// Endpoint that originally sent the notification.
+    pub source_endpoint_id: String,
+    /// Identifier of the notification the action belongs to.
+    pub notification_id: String,
+    /// Identifier of the activated action.
+    pub action_id: String,
 }
 
 /// Failure while sending or receiving notifications.
@@ -74,6 +96,13 @@ pub enum NotificationError {
     Lagged { count: u64 },
     #[error("failed to run notification work on the Mist native executor: {reason}")]
     Executor { reason: String },
+    #[error("notification {notification_id} is no longer available")]
+    UnknownNotification { notification_id: String },
+    #[error("action {action_id} is not available on notification {notification_id}")]
+    UnknownAction {
+        notification_id: String,
+        action_id: String,
+    },
 }
 
 /// Event-driven stream of remote notifications.
@@ -94,4 +123,30 @@ pub trait NotificationChannel: Send + Sync + Debug {
     ) -> Result<(), NotificationError>;
 
     fn subscribe(&self) -> Arc<dyn NotificationEventStream>;
+
+    /// Activates an action on a notification that originated on `source_endpoint_id`.
+    ///
+    /// The owning device performs the action; this returns once it was delivered,
+    /// not once the remote app has finished handling it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action is unknown or the device is unreachable.
+    async fn activate(
+        &self,
+        source_endpoint_id: String,
+        notification_id: String,
+        action_id: String,
+    ) -> Result<(), NotificationError>;
+
+    /// Creates a stream of actions activated on notifications this device sent.
+    fn subscribe_activations(&self) -> Arc<dyn NotificationActivationStream>;
+}
+
+/// Event-driven stream of actions activated on notifications this device sent.
+#[uniffi::export]
+#[async_trait]
+pub trait NotificationActivationStream: Send + Sync + Debug {
+    /// Suspends until the next activated action is available.
+    async fn next(&self) -> Result<ActivatedNotificationAction, NotificationError>;
 }
