@@ -8,14 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use mist_app_contract::{
-    ClipboardContent, ConnectionTransport, DeviceClass, DeviceInfo, DeviceStatus, ManagedDevice,
-    MediaCommand, MistApp, Notification, NotificationAction, NotificationImage, NotificationKind,
-    Platform,
+    ClipboardContent, ConnectionTransport, DeviceStatus, ManagedDevice, MediaCommand, MistApp,
+    Notification, NotificationAction, NotificationImage, NotificationKind,
 };
 use mist_core::host::MistFactory;
 use mist_linux::clipboard::{LocalClipboardProvider, WaylandClipboard};
 use mist_linux::media::{MprisMedia, MprisPublisher};
-use mist_linux::{BUS_NAME, DeviceRow, MediaRow, OBJECT_PATH};
+use mist_linux::{BUS_NAME, DeviceRow, MediaRow, OBJECT_PATH, local_device_info};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use zbus::object_server::SignalEmitter;
@@ -771,18 +770,6 @@ fn device_row(device: &ManagedDevice) -> DeviceRow {
         .to_owned(),
         device.selected,
     )
-}
-
-fn local_device_info() -> DeviceInfo {
-    let display_name = env::var("HOSTNAME")
-        .ok()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "Mist Linux".to_owned());
-    DeviceInfo {
-        display_name,
-        device_class: DeviceClass::Desktop,
-        platform: Platform::Linux,
-    }
 }
 
 fn state_directory() -> Result<PathBuf, Box<dyn Error + Send + Sync>> {

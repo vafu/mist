@@ -1,7 +1,10 @@
 //! Shared Linux D-Bus contract used by the daemon and CLI.
 
 pub mod clipboard;
+pub mod host;
 pub mod media;
+
+pub use host::local_device_info;
 
 /// Well-known session bus name owned by `mistd`.
 pub const BUS_NAME: &str = "io.github.vafu.Mist";
