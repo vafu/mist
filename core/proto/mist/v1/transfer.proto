@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package mist.v1;
+
+// One file offer sent over the authenticated Mist session.
+//
+// The ticket points at an iroh-blobs provider for the same sender endpoint.
+// Receiving this frame grants that sender's ticket hash to the receiver until
+// the offer is superseded or the runtime shuts down.
+message FileOffer {
+  string id = 1;
+  string name = 2;
+  uint64 size = 3;
+  string ticket = 4;
+}

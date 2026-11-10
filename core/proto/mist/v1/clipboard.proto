@@ -18,5 +18,8 @@ message ClipboardText {
 
 message ClipboardBlob {
   uint64 size = 1;
+  // BLAKE3 content hash. Field name retained for wire compatibility.
   bytes sha256 = 2;
+  // iroh-blobs ticket for the content. Content is pulled from the sender.
+  string ticket = 3;
 }

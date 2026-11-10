@@ -23,6 +23,8 @@ pub struct MistBuilder {
     store: Arc<dyn StateStore>,
     local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
     blob_directory: std::path::PathBuf,
+    file_store_directory: std::path::PathBuf,
+    file_inbox_directory: Option<std::path::PathBuf>,
 }
 
 impl MistBuilder {
@@ -40,6 +42,8 @@ impl MistBuilder {
             ),
             local_addresses,
             blob_directory: std::env::temp_dir().join("mist-clipboard"),
+            file_store_directory: unique_temp_directory("mist-files"),
+            file_inbox_directory: None,
         }
     }
 
@@ -47,6 +51,22 @@ impl MistBuilder {
     #[must_use]
     pub fn blob_directory(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
         self.blob_directory = directory.into();
+        self
+    }
+
+    /// Sets the app-private directory used for transferred file blobs.
+    #[must_use]
+    pub fn file_store_directory(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.file_store_directory = directory.into();
+        self
+    }
+
+    /// Sets the directory where accepted incoming files are stored.
+    ///
+    /// Without an inbox, incoming offers can be listed but not accepted.
+    #[must_use]
+    pub fn file_inbox_directory(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.file_inbox_directory = Some(directory.into());
         self
     }
 
@@ -92,14 +112,45 @@ impl MistBuilder {
     /// Returns [`MistError::Bind`] when Iroh cannot bind the configured
     /// endpoint.
     pub async fn bind(self) -> Result<Arc<MistRuntime>, MistError> {
-        let endpoint = self.endpoint.bind().await?;
+        let endpoint = self
+            .endpoint
+            .alpns(vec![MIST_ALPN.to_vec(), iroh_blobs::ALPN.to_vec()])
+            .bind()
+            .await?;
+        let authorization = crate::transfer::ShareAuthorization::default();
+        let blob_store = crate::transfer::IrohBlobStore::load(
+            self.file_store_directory,
+            &endpoint,
+            authorization,
+        )
+        .await
+        .map_err(|error| MistError::Transfer {
+            reason: error.to_string(),
+        })?;
         MistRuntime::from_endpoint(
             endpoint,
             &self.device_info,
             self.store,
             self.local_addresses,
             self.blob_directory,
+            std::sync::Arc::new(blob_store),
+            self.file_inbox_directory,
         )
         .map_err(MistError::from)
     }
+}
+
+fn unique_temp_directory(prefix: &str) -> std::path::PathBuf {
+    let mut random = [0_u8; 16];
+    let suffix = if getrandom::fill(&mut random).is_ok() {
+        let mut suffix = String::with_capacity(random.len() * 2);
+        for byte in random {
+            use std::fmt::Write as _;
+            let _ = write!(&mut suffix, "{byte:02x}");
+        }
+        suffix
+    } else {
+        std::process::id().to_string()
+    };
+    std::env::temp_dir().join(format!("{prefix}-{suffix}"))
 }

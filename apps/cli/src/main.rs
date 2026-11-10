@@ -33,6 +33,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Some("notify") => notify(&mist, arguments).await?,
         Some("clipboard") => clipboard(&mist, arguments).await?,
         Some("clipboard-file") => clipboard_file(&mist, arguments).await?,
+        Some("share") => share_file(&mist, arguments).await?,
         Some("watch") if arguments.next().is_none() => watch(&mist).await?,
         Some("shutdown") if arguments.next().is_none() => mist.shutdown().await?,
         _ => print_usage(),
@@ -112,12 +113,14 @@ async fn forget(
 
 async fn notify(
     proxy: &MistProxy<'_>,
-    mut arguments: impl Iterator<Item = String>,
+    arguments: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
+    let (mut arguments, targets) = split_options(arguments.collect())?;
     let title = arguments
-        .next()
+        .first()
+        .cloned()
         .ok_or_else(|| invalid_input("notify requires a title"))?;
-    let mut rest = arguments.collect::<Vec<_>>();
+    let mut rest = arguments.split_off(1);
     let mut image_path = String::new();
     if let Some(index) = rest.iter().position(|argument| argument == "--image")
         && index + 1 < rest.len()
@@ -126,33 +129,83 @@ async fn notify(
         rest.remove(index);
     }
     let body = rest.join(" ");
-    proxy.push_notification(&title, &body, &image_path).await?;
+    proxy
+        .push_notification(&title, &body, &image_path, targets)
+        .await?;
     Ok(())
 }
 
 async fn clipboard(
     proxy: &MistProxy<'_>,
-    mut arguments: impl Iterator<Item = String>,
+    arguments: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
+    let (arguments, targets) = split_options(arguments.collect())?;
     let text = arguments
-        .next()
+        .first()
+        .cloned()
         .ok_or_else(|| invalid_input("clipboard requires text"))?;
-    proxy.push_clipboard_text(&text).await?;
+    proxy.push_clipboard_text(&text, targets).await?;
     Ok(())
 }
 
 async fn clipboard_file(
     proxy: &MistProxy<'_>,
-    mut arguments: impl Iterator<Item = String>,
+    arguments: impl Iterator<Item = String>,
 ) -> Result<(), Box<dyn Error>> {
+    let (arguments, targets) = split_options(arguments.collect())?;
     let path = arguments
-        .next()
+        .first()
+        .cloned()
         .ok_or_else(|| invalid_input("clipboard-file requires a path"))?;
     let mime_type = arguments
-        .next()
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "application/octet-stream".to_owned());
-    proxy.push_clipboard_blob(&path, &mime_type).await?;
+    proxy
+        .push_clipboard_blob(&path, &mime_type, targets)
+        .await?;
     Ok(())
+}
+
+async fn share_file(
+    proxy: &MistProxy<'_>,
+    arguments: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let (arguments, targets) = split_options(arguments.collect())?;
+    let path = arguments
+        .first()
+        .cloned()
+        .ok_or_else(|| invalid_input("share requires a path"))?;
+    proxy.share_file(&path, targets).await?;
+    Ok(())
+}
+
+/// Splits `--targets=a,b` / `--targets a,b` options from positional arguments.
+fn split_options(arguments: Vec<String>) -> Result<(Vec<String>, Vec<String>), io::Error> {
+    let mut positional = Vec::new();
+    let mut targets = Vec::new();
+    let mut remaining = arguments.into_iter();
+    while let Some(argument) = remaining.next() {
+        if let Some(value) = argument.strip_prefix("--targets=") {
+            targets.extend(split_targets(value));
+        } else if argument == "--targets" {
+            let value = remaining
+                .next()
+                .ok_or_else(|| invalid_input("--targets requires an endpoint ID list"))?;
+            targets.extend(split_targets(&value));
+        } else {
+            positional.push(argument);
+        }
+    }
+    Ok((positional, targets))
+}
+
+fn split_targets(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .map(str::to_owned)
 }
 
 async fn watch(proxy: &MistProxy<'_>) -> zbus::Result<()> {
@@ -223,9 +276,38 @@ fn print_usage() {
     eprintln!("  mist pair | pair-cancel");
     eprintln!("  mist select|unselect <endpoint-id>");
     eprintln!("  mist connect|disconnect|forget <endpoint-id>");
-    eprintln!("  mist notify <title> [body]");
-    eprintln!("  mist clipboard <text>");
-    eprintln!("  mist clipboard-file <path> [mime-type]");
+    eprintln!("  mist notify <title> [body] [--targets <id,...>]");
+    eprintln!("  mist clipboard <text> [--targets <id,...>]");
+    eprintln!("  mist clipboard-file <path> [mime-type] [--targets <id,...>]");
+    eprintln!("  mist share <path> [--targets <id,...>]");
     eprintln!("  mist watch");
     eprintln!("  mist shutdown");
+}
+
+#[cfg(test)]
+mod test {
+    use super::split_options;
+
+    #[test]
+    fn targets_accept_comma_separated_and_repeated_forms() {
+        let (positional, targets) = split_options(vec![
+            "--targets".to_owned(),
+            "a,b".to_owned(),
+            "body".to_owned(),
+            "--targets=c".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(positional, vec!["body".to_owned()]);
+        assert_eq!(
+            targets,
+            vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn no_targets_means_selected_devices() {
+        let (positional, targets) = split_options(vec!["hello".to_owned()]).unwrap();
+        assert_eq!(positional, vec!["hello".to_owned()]);
+        assert!(targets.is_empty());
+    }
 }

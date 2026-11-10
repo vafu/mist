@@ -39,12 +39,12 @@ use crate::protocol::{
     session_hello, write_control_frame,
 };
 use crate::storage::{AddressSource, StateStore, StoreError};
-use crate::transfer::{BlobMetadata, inspect_file, receive_blob};
+use crate::transfer::{BlobStore, StoredBlob};
 use crate::{
-    Clipboard, ClipboardContent, ClipboardError, DeviceError, DeviceInfo, DeviceManager, MIST_ALPN,
-    ManagedDevice, MediaCommand, MediaError, MediaEvent, MediaPlayer, MistApp, Notification,
-    NotificationChannel, NotificationError, NotificationKind, Pairing, ReceivedClipboard,
-    ReceivedNotification,
+    Clipboard, ClipboardContent, ClipboardError, DeviceError, DeviceInfo, DeviceManager, FileOffer,
+    FileShare, FileTransfer, MIST_ALPN, ManagedDevice, MediaCommand, MediaError, MediaEvent,
+    MediaPlayer, MistApp, Notification, NotificationChannel, NotificationError, NotificationKind,
+    Pairing, ReceivedClipboard, ReceivedNotification, TransferError,
 };
 
 pub(crate) use builder::MistBuilder;
@@ -67,6 +67,18 @@ pub(crate) enum MistError {
     /// Persisted identity, trust, or address state could not be loaded.
     #[error("Mist state storage failed")]
     Storage(#[from] StoreError),
+    /// The local blob store could not be opened.
+    #[error("Mist file storage failed: {reason}")]
+    Transfer { reason: String },
+}
+
+/// Artwork pinned in the blob store while its snapshot is being shared.
+struct StoredMediaArtwork {
+    mime_type: String,
+    size: u64,
+    hash: iroh_blobs::Hash,
+    ticket: String,
+    _tag: StoredBlob,
 }
 
 pub(crate) struct IncomingPairingAttempt {
@@ -98,6 +110,11 @@ pub(crate) struct Session {
     activations: broadcast::Sender<crate::ActivatedNotificationAction>,
     sent_notifications: StdMutex<std::collections::HashMap<String, Vec<String>>>,
     blob_directory: std::path::PathBuf,
+    files: Arc<dyn BlobStore>,
+    file_shares: StdMutex<std::collections::HashMap<String, StoredBlob>>,
+    file_offers: broadcast::Sender<FileOffer>,
+    received_files: broadcast::Sender<crate::ReceivedFile>,
+    file_inbox_directory: Option<std::path::PathBuf>,
     pairing_attempts_tx: mpsc::Sender<IncomingPairingAttempt>,
     pairing_attempts_rx: Arc<Mutex<mpsc::Receiver<IncomingPairingAttempt>>>,
     outbox: Outbox,
@@ -115,10 +132,14 @@ impl Session {
         store: Arc<dyn StateStore>,
         local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
         blob_directory: std::path::PathBuf,
+        files: Arc<dyn BlobStore>,
+        file_inbox_directory: Option<std::path::PathBuf>,
     ) -> Result<Arc<Self>, StoreError> {
         let (notifications, _) = broadcast::channel(256);
         let (clipboard, _) = broadcast::channel(64);
         let (activations, _) = broadcast::channel(64);
+        let (file_offers, _) = broadcast::channel(64);
+        let (received_files, _) = broadcast::channel(64);
         let (pairing_attempts_tx, pairing_attempts_rx) = mpsc::channel(32);
         let devices = DeviceRegistry::new(store.load_devices()?);
         Ok(Arc::new(Self {
@@ -133,6 +154,11 @@ impl Session {
             activations,
             sent_notifications: StdMutex::new(std::collections::HashMap::new()),
             blob_directory,
+            files,
+            file_shares: StdMutex::new(std::collections::HashMap::new()),
+            file_offers,
+            received_files,
+            file_inbox_directory,
             pairing_attempts_tx,
             pairing_attempts_rx: Arc::new(Mutex::new(pairing_attempts_rx)),
             outbox: Outbox::default(),
@@ -313,8 +339,11 @@ impl Session {
 
     /// Sends the current local player snapshot to one peer.
     fn send_media_snapshot_to(self: &Arc<Self>, connection: Connection) {
-        let snapshot = encode_media_snapshot(&self.media.list());
+        let players = self.media.list();
+        let endpoint_id = connection.remote_id();
+        let session = Arc::clone(self);
         self.executor.spawn(async move {
+            let snapshot = session.encode_snapshot(&players, &[endpoint_id]).await;
             let Ok(mut stream) = connection.open_uni().await else {
                 return;
             };
@@ -360,15 +389,16 @@ impl Session {
     /// Broadcasts the local player snapshot to every connected peer.
     fn publish_media_snapshot(self: &Arc<Self>) {
         let players = self.media.list();
-        let snapshot = encode_media_snapshot(&players);
         let connections = self.devices.selected_connections();
+        let session = Arc::clone(self);
         for (endpoint_id, connection) in connections {
             let Some(connection) = connection else {
                 continue;
             };
-            let _ = endpoint_id;
-            let snapshot = snapshot.clone();
+            let session = Arc::clone(&session);
+            let players = players.clone();
             self.executor.spawn(async move {
+                let snapshot = session.encode_snapshot(&players, &[endpoint_id]).await;
                 let Ok(mut stream) = connection.open_uni().await else {
                     return;
                 };
@@ -380,6 +410,65 @@ impl Session {
                 }
             });
         }
+    }
+
+    /// Imports local artwork and encodes a snapshot, authorizing artwork for `peers`.
+    async fn encode_snapshot(
+        &self,
+        players: &[crate::MediaPlayer],
+        peers: &[EndpointId],
+    ) -> crate::protocol::wire::MediaSnapshot {
+        let mut entries = Vec::with_capacity(players.len());
+        let mut artwork = Vec::with_capacity(players.len());
+        for player in players {
+            let stored = self.import_media_artwork(player).await;
+            if let Some(stored) = &stored {
+                for peer in peers {
+                    self.files.authorize(*peer, stored.hash);
+                }
+            }
+            artwork.push(stored);
+        }
+        for (player, stored) in players.iter().zip(artwork) {
+            entries.push(crate::protocol::MediaSnapshotEntry {
+                player,
+                artwork: stored
+                    .as_ref()
+                    .map(|stored| crate::protocol::MediaArtworkWire {
+                        mime_type: stored.mime_type.clone(),
+                        size: stored.size,
+                        hash: stored.hash,
+                        ticket: stored.ticket.clone(),
+                    }),
+            });
+        }
+        encode_media_snapshot(&entries)
+    }
+
+    /// Imports a player's local artwork into the blob store.
+    ///
+    /// Only local files are imported. Remote `art_url` values are passed through
+    /// to peers as-is, since fetching arbitrary URLs is a platform concern.
+    async fn import_media_artwork(
+        &self,
+        player: &crate::MediaPlayer,
+    ) -> Option<StoredMediaArtwork> {
+        let artwork = player.metadata.artwork.as_ref()?;
+        let mime_type = artwork.mime_type.clone();
+        let path = std::path::PathBuf::from(&artwork.path);
+        if !mime_type.starts_with("image/") {
+            return None;
+        }
+        let stored = self.files.import_file(path.clone()).await.ok()?;
+        let size = std::fs::metadata(&path).ok()?.len();
+        let ticket = self.files.ticket(stored.hash).to_string();
+        Some(StoredMediaArtwork {
+            mime_type,
+            size,
+            hash: stored.hash,
+            ticket,
+            _tag: stored,
+        })
     }
 
     /// Routes a transport command to a remote player.
@@ -463,6 +552,156 @@ impl Session {
         let connection = self.endpoint.connect(peer, MIST_ALPN).await?;
         debug_assert_eq!(connection.remote_id(), expected_id);
         Ok(connection)
+    }
+
+    pub(crate) fn subscribe_files(&self) -> broadcast::Receiver<FileOffer> {
+        self.file_offers.subscribe()
+    }
+
+    pub(crate) fn subscribe_inbox(&self) -> broadcast::Receiver<crate::ReceivedFile> {
+        self.received_files.subscribe()
+    }
+
+    pub(crate) async fn share_file(
+        self: &Arc<Self>,
+        path: String,
+        targets: Vec<String>,
+    ) -> Result<FileShare, TransferError> {
+        let stored = self
+            .files
+            .import_file(std::path::PathBuf::from(&path))
+            .await?;
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(TransferError::Unreadable {
+                path: path.clone(),
+                reason: "the path has no file name".to_owned(),
+            })?
+            .to_owned();
+        let size = std::fs::metadata(&path)
+            .map_err(|error| TransferError::Unreadable {
+                path: path.clone(),
+                reason: error.to_string(),
+            })?
+            .len();
+        let id = stored.hash.to_hex();
+        let ticket = iroh_blobs::ticket::BlobTicket::new(
+            self.endpoint.addr(),
+            stored.hash,
+            iroh_blobs::BlobFormat::Raw,
+        )
+        .to_string();
+        let targets = self.resolve_file_targets(targets)?;
+        for endpoint_id in targets {
+            self.files.authorize(endpoint_id, stored.hash);
+            self.schedule(
+                endpoint_id,
+                Outbound::FileOffer(FileShare {
+                    id: id.clone(),
+                    name: name.clone(),
+                    size,
+                    ticket: ticket.clone(),
+                }),
+            );
+        }
+        let share = FileShare {
+            id: id.clone(),
+            name,
+            size,
+            ticket,
+        };
+        self.file_shares
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, stored);
+        Ok(share)
+    }
+
+    pub(crate) async fn accept_file(
+        self: &Arc<Self>,
+        offer: FileOffer,
+    ) -> Result<String, TransferError> {
+        let session = Arc::clone(self);
+        let executor = self.executor.clone();
+        executor
+            .spawn(async move { session.accept_file_inner(offer).await })
+            .await
+            .map_err(|error| TransferError::Transport {
+                reason: error.to_string(),
+            })?
+    }
+
+    async fn accept_file_inner(&self, offer: FileOffer) -> Result<String, TransferError> {
+        let endpoint_id = EndpointId::from_str(&offer.source_endpoint_id).map_err(|error| {
+            TransferError::InvalidEndpointId {
+                reason: error.to_string(),
+            }
+        })?;
+        if !self.devices.contains(endpoint_id) {
+            return Err(TransferError::UntrustedSource);
+        }
+        let ticket = iroh_blobs::ticket::BlobTicket::from_str(&offer.ticket).map_err(|_| {
+            TransferError::Transport {
+                reason: "invalid file ticket".to_owned(),
+            }
+        })?;
+        if ticket.addr().id != endpoint_id {
+            return Err(TransferError::UntrustedSource);
+        }
+        let destination = self
+            .file_inbox_directory
+            .clone()
+            .ok_or(TransferError::InboxNotConfigured)?;
+        self.files.download(endpoint_id, ticket.hash()).await?;
+        let file_name = available_file_name(&destination, &offer.name)?;
+        let path = self
+            .files
+            .export(ticket.hash(), destination, &file_name)
+            .await?;
+        let source_device = self
+            .devices
+            .device_info(endpoint_id)
+            .unwrap_or_else(|| offer.source_device.clone());
+        let _ = self.received_files.send(crate::ReceivedFile {
+            source_endpoint_id: endpoint_id.to_string(),
+            source_device,
+            name: offer.name,
+            path: path.to_string_lossy().into_owned(),
+            size: std::fs::metadata(&path).map_or(0, |metadata| metadata.len()),
+        });
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    fn resolve_file_targets(&self, targets: Vec<String>) -> Result<Vec<EndpointId>, TransferError> {
+        if targets.is_empty() {
+            let selected = self
+                .devices
+                .selected_connections()
+                .into_iter()
+                .map(|(endpoint_id, _)| endpoint_id)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(TransferError::NoSelectedDevices);
+            }
+            return Ok(selected);
+        }
+        targets
+            .into_iter()
+            .map(|target| {
+                let endpoint_id = EndpointId::from_str(&target).map_err(|error| {
+                    TransferError::InvalidEndpointId {
+                        reason: error.to_string(),
+                    }
+                })?;
+                if !self.devices.contains(endpoint_id) {
+                    return Err(TransferError::UnknownDevice {
+                        endpoint_id: target,
+                    });
+                }
+                Ok(endpoint_id)
+            })
+            .collect()
     }
 
     pub(crate) fn install(
@@ -580,8 +819,12 @@ impl Session {
         });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "control frames share one dispatch loop"
+    )]
     async fn receive_feature_frame(
-        &self,
+        self: &Arc<Self>,
         endpoint_id: EndpointId,
         generation: u64,
         mut stream: RecvStream,
@@ -594,7 +837,7 @@ impl Session {
                 let Ok(decoded) = decode_notification_with_images(wire) else {
                     return;
                 };
-                let notification = self.receive_notification_images(&mut stream, decoded).await;
+                let notification = self.receive_notification_images(endpoint_id, decoded).await;
                 let Some(source_device) = self.devices.device_info(endpoint_id) else {
                     return;
                 };
@@ -611,48 +854,71 @@ impl Session {
                 let Some(source_device) = self.devices.device_info(endpoint_id) else {
                     return;
                 };
-                let (content, sha256) = match metadata {
+                let (content, content_id) = match metadata {
                     ClipboardMetadata::Text { text } => {
                         let fingerprint = crate::runtime::outbox::text_fingerprint(&text);
                         (ClipboardContent::Text { text }, fingerprint)
                     }
-                    ClipboardMetadata::Blob {
-                        mime_type,
-                        size,
-                        sha256,
-                    } => {
-                        let metadata = BlobMetadata {
-                            mime_type,
-                            size,
-                            sha256,
+                    ClipboardMetadata::Blob { mime_type, ticket } => {
+                        let hash = ticket.hash();
+                        let Ok(()) = self.files.download(endpoint_id, hash).await else {
+                            return;
                         };
-                        let Ok(path) =
-                            receive_blob(&mut stream, &self.blob_directory, &metadata).await
+                        let Ok(path) = self
+                            .files
+                            .export(
+                                hash,
+                                self.blob_directory.clone(),
+                                &format!("{}.blob", hash.to_hex()),
+                            )
+                            .await
                         else {
                             return;
                         };
                         (
                             ClipboardContent::Blob {
-                                mime_type: metadata.mime_type,
+                                mime_type,
                                 path: path.to_string_lossy().into_owned(),
                             },
-                            sha256,
+                            *hash.as_bytes(),
                         )
                     }
                 };
-                self.outbox.remember_received(sha256);
+                self.outbox.remember_received(content_id);
                 let _ = self.clipboard.send(ReceivedClipboard {
                     source_endpoint_id: endpoint_id.to_string(),
                     source_device,
                     content,
-                    sha256: hex(&sha256),
+                    sha256: hex(&content_id),
                 });
             }
             Some(control_frame::Body::NotificationActionActivated(wire)) => {
                 self.receive_notification_activation(endpoint_id, wire);
             }
+            Some(control_frame::Body::FileOffer(wire)) => {
+                let Ok(offer) = crate::protocol::decode_file_offer(wire) else {
+                    return;
+                };
+                let Ok(ticket) = iroh_blobs::ticket::BlobTicket::from_str(&offer.ticket) else {
+                    return;
+                };
+                if ticket.addr().id != endpoint_id {
+                    return;
+                }
+                let Some(source_device) = self.devices.device_info(endpoint_id) else {
+                    return;
+                };
+                let _ = self.file_offers.send(FileOffer {
+                    source_endpoint_id: endpoint_id.to_string(),
+                    source_device,
+                    id: offer.id,
+                    name: offer.name,
+                    size: offer.size,
+                    ticket: offer.ticket,
+                });
+            }
             Some(control_frame::Body::MediaSnapshot(snapshot)) => {
-                self.receive_media_snapshot(endpoint_id, snapshot);
+                Arc::clone(self).receive_media_snapshot(endpoint_id, snapshot);
             }
             Some(control_frame::Body::MediaCommand(request)) => {
                 self.receive_media_command(request).await;
@@ -674,7 +940,7 @@ impl Session {
     /// Streams notification artwork into app-private files.
     async fn receive_notification_images(
         &self,
-        stream: &mut RecvStream,
+        endpoint_id: EndpointId,
         decoded: crate::protocol::DecodedNotification,
     ) -> crate::Notification {
         let crate::protocol::DecodedNotification {
@@ -698,7 +964,15 @@ impl Session {
             let Some(metadata) = images.next() else {
                 continue;
             };
-            if let Ok(path) = receive_blob(stream, &self.blob_directory, &metadata).await
+            if let Ok(()) = self.files.download(endpoint_id, metadata.hash()).await
+                && let Ok(path) = self
+                    .files
+                    .export(
+                        metadata.hash(),
+                        self.blob_directory.clone(),
+                        &format!("{}.blob", metadata.hash().to_hex()),
+                    )
+                    .await
                 && let Some(image) = slot.as_mut()
             {
                 image.path = path.to_string_lossy().into_owned();
@@ -708,22 +982,59 @@ impl Session {
     }
 
     fn receive_media_snapshot(
-        &self,
+        self: &Arc<Self>,
         endpoint_id: EndpointId,
         snapshot: crate::protocol::wire::MediaSnapshot,
     ) {
-        let Ok(players) = decode_media_snapshot(snapshot) else {
+        let Ok(decoded) = decode_media_snapshot(snapshot) else {
             return;
         };
         let Some(device) = self.devices.device_info(endpoint_id) else {
             return;
         };
-        let players = players
-            .iter()
-            .map(|player| crate::media::remote_player(&endpoint_id.to_string(), &device, player))
-            .collect::<Vec<_>>();
-        self.media
-            .set_remote(&endpoint_id.to_string(), &device, &players);
+        let session = Arc::clone(self);
+        self.executor.spawn(async move {
+            let mut players = Vec::with_capacity(decoded.len());
+            for state in &decoded {
+                let mut player =
+                    crate::media::remote_player(&endpoint_id.to_string(), &device, state);
+                player.artwork_path = session
+                    .receive_media_artwork(endpoint_id, state.artwork.as_ref())
+                    .await;
+                players.push(player);
+            }
+            session
+                .media
+                .set_remote(&endpoint_id.to_string(), &device, &players);
+        });
+    }
+
+    /// Downloads one peer's artwork blob into the local blob directory.
+    async fn receive_media_artwork(
+        &self,
+        endpoint_id: EndpointId,
+        artwork: Option<&crate::protocol::MediaArtworkRef>,
+    ) -> Option<String> {
+        let artwork = artwork?;
+        let hash = artwork.ticket.hash();
+        self.files.download(endpoint_id, hash).await.ok()?;
+        let extension = match artwork.mime_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "img",
+        };
+        let path = self
+            .files
+            .export(
+                hash,
+                self.blob_directory.clone(),
+                &format!("media-{}.{extension}", hash.to_hex()),
+            )
+            .await
+            .ok()?;
+        Some(path.to_string_lossy().into_owned())
     }
 
     async fn receive_media_command(&self, request: crate::protocol::wire::MediaCommandRequest) {
@@ -775,7 +1086,11 @@ impl Session {
                 let Ok(connection) = incoming.await else {
                     return;
                 };
-                session.route_connection(connection).await;
+                if connection.alpn() == iroh_blobs::ALPN {
+                    session.files.serve(connection).await;
+                } else {
+                    session.route_connection(connection).await;
+                }
             });
         }
     }
@@ -939,7 +1254,7 @@ impl Session {
         self.devices.forget(endpoint_id)
     }
 
-    pub(crate) fn push_notification(
+    pub(crate) async fn push_notification(
         self: &Arc<Self>,
         notification: &Notification,
         targets: Vec<String>,
@@ -957,24 +1272,66 @@ impl Session {
         })?;
 
         self.remember_sent_notification(notification);
-        crate::protocol::validate_notification_images(notification).map_err(|error| {
-            NotificationError::Transport {
-                reason: error.to_string(),
-            }
-        })?;
-
+        let mut images = Vec::new();
+        for (image, limit, label) in [
+            (
+                notification.app_icon.as_ref(),
+                crate::protocol::MAX_NOTIFICATION_ICON_BYTES,
+                "icon",
+            ),
+            (
+                notification.image.as_ref(),
+                crate::protocol::MAX_NOTIFICATION_IMAGE_BYTES,
+                "image",
+            ),
+        ] {
+            let Some(image) = image else {
+                images.push(None);
+                continue;
+            };
+            let attachment = self
+                .prepare_attachment(&image.mime_type, &image.path, limit)
+                .await
+                .map_err(|error| NotificationError::Transport {
+                    reason: format!("{label}: {error}"),
+                })?;
+            images.push(Some(attachment));
+        }
         for endpoint_id in targets {
-            self.schedule(endpoint_id, Outbound::Notification(notification.clone()));
+            for image in images.iter().flatten() {
+                self.files.authorize(endpoint_id, image.hash);
+            }
+            self.schedule(
+                endpoint_id,
+                Outbound::Notification {
+                    notification: notification.clone(),
+                    images: images.clone(),
+                },
+            );
         }
         Ok(())
     }
 
-    pub(crate) fn push_clipboard(
+    pub(crate) async fn push_clipboard(
         self: &Arc<Self>,
         content: &ClipboardContent,
         targets: Vec<String>,
     ) -> Result<(), ClipboardError> {
-        let metadata = clipboard_blob_metadata(content)?;
+        let blob = match content {
+            ClipboardContent::Text { text } => {
+                if text.is_empty() {
+                    return Err(ClipboardError::Empty);
+                }
+                None
+            }
+            ClipboardContent::Blob { mime_type, path } => Some(
+                self.prepare_attachment(mime_type, path, crate::protocol::MAX_CLIPBOARD_BLOB_BYTES)
+                    .await
+                    .map_err(|error| ClipboardError::Unreadable {
+                        reason: error.to_string(),
+                    })?,
+            ),
+        };
 
         let targets = self.resolve_targets(targets).map_err(|error| match error {
             TargetError::Invalid(reason) => ClipboardError::InvalidEndpointId { reason },
@@ -983,15 +1340,52 @@ impl Session {
         })?;
 
         for endpoint_id in targets {
+            if let Some(blob) = blob.as_ref() {
+                self.files.authorize(endpoint_id, blob.hash);
+            }
             self.schedule(
                 endpoint_id,
                 Outbound::Clipboard {
                     content: content.clone(),
-                    metadata: metadata.clone(),
+                    blob: blob.clone(),
                 },
             );
         }
         Ok(())
+    }
+
+    async fn prepare_attachment(
+        &self,
+        mime_type: &str,
+        path: &str,
+        limit: u64,
+    ) -> Result<crate::runtime::outbox::BlobAttachment, TransferError> {
+        crate::protocol::validate_mime_type(mime_type).map_err(|error| {
+            TransferError::Transport {
+                reason: error.to_string(),
+            }
+        })?;
+        let stored = self
+            .files
+            .import_file(std::path::PathBuf::from(path))
+            .await?;
+        let size = std::fs::metadata(path)
+            .map_err(|error| TransferError::Unreadable {
+                path: path.to_owned(),
+                reason: error.to_string(),
+            })?
+            .len();
+        if size > limit {
+            return Err(TransferError::Transport {
+                reason: format!("attachment exceeds {limit} bytes"),
+            });
+        }
+        Ok(crate::runtime::outbox::BlobAttachment {
+            mime_type: mime_type.to_owned(),
+            size,
+            hash: stored.hash,
+            ticket: self.files.ticket(stored.hash),
+        })
     }
 
     /// Resolves explicit targets, or every selected device when none are given.
@@ -1089,6 +1483,7 @@ impl Session {
 
     async fn close(&self) {
         self.devices.close_all();
+        let _ = self.files.shutdown().await;
         self.endpoint.close().await;
     }
 }
@@ -1101,27 +1496,6 @@ enum TargetError {
     NoSelected,
 }
 
-fn clipboard_blob_metadata(
-    content: &ClipboardContent,
-) -> Result<Option<BlobMetadata>, ClipboardError> {
-    match content {
-        ClipboardContent::Text { text } => {
-            if text.is_empty() {
-                Err(ClipboardError::Empty)
-            } else {
-                Ok(None)
-            }
-        }
-        ClipboardContent::Blob { mime_type, path } => {
-            inspect_file(mime_type, std::path::Path::new(path))
-                .map(Some)
-                .map_err(|error| ClipboardError::Unreadable {
-                    reason: error.to_string(),
-                })
-        }
-    }
-}
-
 fn hex(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1129,6 +1503,56 @@ fn hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+fn available_file_name(
+    directory: &std::path::Path,
+    requested: &str,
+) -> Result<String, TransferError> {
+    let candidate = std::path::Path::new(requested);
+    let name = candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| *name != "." && *name != "..")
+        .ok_or(TransferError::Transport {
+            reason: "offered file name is invalid".to_owned(),
+        })?;
+    if !directory.join(name).exists() {
+        return Ok(name.to_owned());
+    }
+    let stem = candidate
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let extension = candidate
+        .extension()
+        .and_then(|extension| extension.to_str());
+    for index in 1..u32::MAX {
+        let candidate = extension.map_or_else(
+            || format!("{stem} ({index})"),
+            |extension| format!("{stem} ({index}).{extension}"),
+        );
+        if !directory.join(&candidate).exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(TransferError::Destination {
+        reason: "could not choose an unused inbox file name".to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod inbox_test {
+    use super::available_file_name;
+
+    #[test]
+    fn available_file_name_uses_the_offered_name_when_free() {
+        let directory = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            available_file_name(directory.path(), "photo.png").unwrap(),
+            "photo.png"
+        );
+    }
 }
 
 /// Root object for one running Mist instance.
@@ -1143,6 +1567,7 @@ pub(crate) struct MistRuntime {
     notifications: Arc<dyn NotificationChannel>,
     clipboard: Arc<dyn Clipboard>,
     media_service: Arc<dyn crate::Media>,
+    files: Arc<dyn FileTransfer>,
 }
 
 impl MistRuntime {
@@ -1152,6 +1577,8 @@ impl MistRuntime {
         store: Arc<dyn StateStore>,
         local_addresses: tokio::sync::watch::Receiver<Option<PublishedAddresses>>,
         blob_directory: std::path::PathBuf,
+        files: Arc<dyn BlobStore>,
+        file_inbox_directory: Option<std::path::PathBuf>,
     ) -> Result<Arc<Self>, StoreError> {
         let session = Session::new(
             endpoint,
@@ -1159,12 +1586,17 @@ impl MistRuntime {
             store,
             local_addresses,
             blob_directory,
+            files,
+            file_inbox_directory,
         )?;
         session.start();
         let pairing = Arc::new(IrohPairing::new(Arc::clone(&session)));
         let notifications = Arc::new(IrohNotificationChannel::new(Arc::clone(&session)));
         let clipboard = Arc::new(IrohClipboard::new(Arc::clone(&session)));
         let media_service = Arc::new(IrohMedia::new(Arc::clone(&session)));
+        let files = Arc::new(crate::transfer::RuntimeFileTransfer::new(Arc::clone(
+            &session,
+        )));
         let devices = Arc::new(RuntimeDeviceManager::new(Arc::clone(&session)));
         Ok(Arc::new(Self {
             session,
@@ -1173,6 +1605,7 @@ impl MistRuntime {
             notifications,
             clipboard,
             media_service,
+            files,
         }))
     }
 
@@ -1244,6 +1677,10 @@ impl MistApp for MistRuntime {
 
     fn media(&self) -> Arc<dyn crate::Media> {
         Arc::clone(&self.media_service)
+    }
+
+    fn files(&self) -> Arc<dyn FileTransfer> {
+        Arc::clone(&self.files)
     }
 
     async fn shutdown(&self) {

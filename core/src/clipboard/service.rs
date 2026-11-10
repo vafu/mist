@@ -24,7 +24,7 @@ impl Clipboard for IrohClipboard {
         content: ClipboardContent,
         targets: Vec<String>,
     ) -> Result<(), ClipboardError> {
-        self.session.push_clipboard(&content, targets)
+        self.session.push_clipboard(&content, targets).await
     }
 
     fn subscribe(&self) -> Arc<dyn ClipboardEventStream> {

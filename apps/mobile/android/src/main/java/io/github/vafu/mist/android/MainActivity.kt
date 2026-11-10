@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -20,8 +21,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import io.github.vafu.mist.MistApp
+import kotlinx.coroutines.launch
 
 public class MainActivity : ComponentActivity() {
     private var notificationPostingGranted: Boolean by mutableStateOf(false)
@@ -39,6 +42,19 @@ public class MainActivity : ComponentActivity() {
             val notificationPermission = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission(),
             ) { updateNotificationPermissions() }
+            val scope = rememberCoroutineScope()
+            val shareFilePicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocument(),
+            ) { uri ->
+                if (uri != null) {
+                    scope.launch {
+                        val path = controller.cacheSharedFile(uri, displayName(uri))
+                        if (path != null) {
+                            runCatching { controller.shareFile(path) }
+                        }
+                    }
+                }
+            }
 
             MaterialTheme {
                 Surface {
@@ -57,6 +73,7 @@ public class MainActivity : ComponentActivity() {
                             requestNotificationListener = {
                                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                             },
+                            pickAndShareFile = { shareFilePicker.launch(arrayOf("*/*")) },
                         )
                     }
                 }
@@ -84,4 +101,10 @@ public class MainActivity : ComponentActivity() {
                 ?.contains(component) == true
         }
     }
+
+    private fun displayName(uri: android.net.Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
 }

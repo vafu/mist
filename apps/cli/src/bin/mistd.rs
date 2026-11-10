@@ -158,20 +158,25 @@ impl MistDbus {
             .map_err(fdo_error)
     }
 
-    async fn push_clipboard_text(&self, text: &str) -> zbus::fdo::Result<()> {
+    async fn push_clipboard_text(&self, text: &str, targets: Vec<String>) -> zbus::fdo::Result<()> {
         self.runtime
             .clipboard()
             .push(
                 ClipboardContent::Text {
                     text: text.to_owned(),
                 },
-                Vec::new(),
+                targets,
             )
             .await
             .map_err(fdo_error)
     }
 
-    async fn push_clipboard_blob(&self, path: &str, mime_type: &str) -> zbus::fdo::Result<()> {
+    async fn push_clipboard_blob(
+        &self,
+        path: &str,
+        mime_type: &str,
+        targets: Vec<String>,
+    ) -> zbus::fdo::Result<()> {
         self.runtime
             .clipboard()
             .push(
@@ -179,10 +184,19 @@ impl MistDbus {
                     mime_type: mime_type.to_owned(),
                     path: path.to_owned(),
                 },
-                Vec::new(),
+                targets,
             )
             .await
             .map_err(fdo_error)
+    }
+
+    async fn share_file(&self, path: &str, targets: Vec<String>) -> zbus::fdo::Result<()> {
+        self.runtime
+            .files()
+            .share(path.to_owned(), targets)
+            .await
+            .map_err(fdo_error)?;
+        Ok(())
     }
 
     async fn push_notification(
@@ -190,6 +204,7 @@ impl MistDbus {
         title: &str,
         body: &str,
         image_path: &str,
+        targets: Vec<String>,
     ) -> zbus::fdo::Result<()> {
         let image = (!image_path.is_empty()).then(|| NotificationImage {
             mime_type: guess_image_mime(image_path),
@@ -210,7 +225,7 @@ impl MistDbus {
                     image,
                     actions: Vec::new(),
                 },
-                Vec::new(),
+                targets,
             )
             .await
             .map_err(fdo_error)
@@ -302,6 +317,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         connection.clone(),
         Arc::clone(&runtime),
     ));
+    let mut incoming_files = tokio::spawn(accept_incoming_files(Arc::clone(&runtime)));
 
     println!("mistd ready on {BUS_NAME} ({})", runtime.endpoint_id());
     tokio::select! {
@@ -315,6 +331,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         result = &mut incoming_clipboard => result??,
         result = &mut local_clipboard_changes => result??,
         result = &mut published_media => result??,
+        result = &mut incoming_files => result??,
     }
 
     device_events.abort();
@@ -323,8 +340,24 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     incoming_clipboard.abort();
     local_clipboard_changes.abort();
     published_media.abort();
+    incoming_files.abort();
     runtime.shutdown().await;
     Ok(())
+}
+
+/// Accepts every file offered by a trusted peer into the configured inbox.
+async fn accept_incoming_files(
+    runtime: Arc<dyn MistApp>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let files = runtime.files();
+    let offers = files.subscribe();
+    loop {
+        let offer = offers.next().await?;
+        match files.accept(offer.clone()).await {
+            Ok(path) => println!("mistd: received {} at {path}", offer.name),
+            Err(error) => eprintln!("mistd: could not accept {}: {error}", offer.name),
+        }
+    }
 }
 
 async fn forward_device_events(
@@ -407,7 +440,7 @@ fn hint_image(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<Notifica
     let raw = <&str>::try_from(value).ok()?;
     let path = raw.strip_prefix("file://").unwrap_or(raw);
     let path = PathBuf::from(percent_decode(path));
-    attach_image(&path, key.contains("icon"))
+    attach_image(&path, key.contains("icon")).or_else(|| theme_icon(raw))
 }
 
 fn file_icon(app_icon: &str) -> Option<NotificationImage> {
@@ -415,7 +448,67 @@ fn file_icon(app_icon: &str) -> Option<NotificationImage> {
         return None;
     }
     let path = app_icon.strip_prefix("file://").unwrap_or(app_icon);
-    attach_image(&PathBuf::from(percent_decode(path)), true)
+    let path = PathBuf::from(percent_decode(path));
+    attach_image(&path, true).or_else(|| theme_icon(app_icon))
+}
+
+/// Resolves a freedesktop icon name through the XDG icon theme directories.
+///
+/// `app_icon` is usually a themed name such as `com.mitchellh.ghostty`, not a
+/// path, so it must be looked up in the installed hicolor tree.
+/// Resolves the `desktop-entry` hint, the usual app identity for `GNotification`
+/// senders such as Ghostty, which leave `app_icon` empty.
+fn desktop_entry_icon(hints: &HashMap<String, OwnedValue>) -> Option<NotificationImage> {
+    let value = hints.get("desktop-entry")?;
+    theme_icon(<&str>::try_from(value).ok()?)
+}
+
+fn theme_icon(name: &str) -> Option<NotificationImage> {
+    const SIZES: [&str; 6] = ["512x512", "256x256", "128x128", "64x64", "48x48", "32x32"];
+
+    let name = name.trim();
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let mut roots = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(data_home).join("icons"));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".local/share/icons"));
+    }
+    for entry in std::env::var_os("XDG_DATA_DIRS")
+        .map_or_else(
+            || "/usr/local/share:/usr/share".to_owned(),
+            |dirs| dirs.to_string_lossy().into_owned(),
+        )
+        .split(':')
+    {
+        if !entry.is_empty() {
+            roots.push(PathBuf::from(entry).join("icons"));
+        }
+    }
+    roots.push(PathBuf::from("/usr/share/pixmaps"));
+    for root in roots {
+        for size in SIZES {
+            for extension in ["png", "svg"] {
+                let candidate = root
+                    .join("hicolor")
+                    .join(size)
+                    .join("apps")
+                    .join(format!("{name}.{extension}"));
+                if let Some(image) = attach_image(&candidate, true) {
+                    return Some(image);
+                }
+            }
+        }
+        for extension in ["png", "svg"] {
+            let candidate = root.join(format!("{name}.{extension}"));
+            if let Some(image) = attach_image(&candidate, true) {
+                return Some(image);
+            }
+        }
+    }
+    None
 }
 
 fn attach_image(path: &std::path::Path, small: bool) -> Option<NotificationImage> {
@@ -617,7 +710,8 @@ async fn monitor_desktop_notifications(
         let icon = hint_image(&hints, "image-path")
             .or_else(|| hint_image(&hints, "image_path"))
             .or_else(|| hint_image(&hints, "app_icon"))
-            .or_else(|| file_icon(&app_icon));
+            .or_else(|| file_icon(&app_icon))
+            .or_else(|| desktop_entry_icon(&hints));
         let image = hint_image(&hints, "image-data").or_else(|| hint_image(&hints, "image_data"));
         let notification = Notification {
             id: format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)),

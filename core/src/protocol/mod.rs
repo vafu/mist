@@ -9,6 +9,7 @@ use std::str::FromStr;
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{EndpointAddr, RelayUrl, TransportAddr};
 use iroh_base::CustomAddr;
+use iroh_blobs::ticket::BlobTicket;
 use prost::Message;
 use thiserror::Error;
 
@@ -71,6 +72,8 @@ pub(crate) enum ProtocolError {
     ClipboardPayloadMismatch,
     #[error("media field {0} exceeds its protocol limit")]
     InvalidMedia(&'static str),
+    #[error("file offer field {0} exceeds its protocol limit")]
+    InvalidFileOffer(&'static str),
 }
 
 pub(crate) async fn write_control_frame(
@@ -268,14 +271,8 @@ fn decode_device(device: &wire::DeviceInfo) -> Result<DeviceInfo, ProtocolError>
 #[derive(Debug)]
 pub(crate) struct DecodedNotification {
     pub(crate) notification: Notification,
-    /// Image metadata in stream order: app icon, then content image.
-    pub(crate) images: Vec<crate::transfer::BlobMetadata>,
-}
-
-/// Encoded notification frame plus the image metadata to stream after it.
-pub(crate) struct EncodedNotification {
-    pub(crate) frame: wire::Notification,
-    pub(crate) images: Vec<crate::transfer::BlobMetadata>,
+    /// Image tickets in stream order: app icon, then content image.
+    pub(crate) images: Vec<BlobTicket>,
 }
 
 pub(crate) const MAX_NOTIFICATION_ACTIONS: usize = 8;
@@ -284,59 +281,21 @@ pub(crate) const MAX_NOTIFICATION_ACTION_LABEL: usize = 128;
 pub(crate) const MAX_NOTIFICATION_ICON_BYTES: u64 = 512 * 1024;
 pub(crate) const MAX_NOTIFICATION_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Encodes notification metadata and inspects attached images.
-///
-/// The caller writes the returned frame, then streams each image in order.
-pub(crate) fn encode_notification_with_images(
-    notification: &Notification,
-) -> Result<EncodedNotification, ProtocolError> {
-    let icon =
-        inspect_notification_image(notification.app_icon.as_ref(), MAX_NOTIFICATION_ICON_BYTES)?;
-    let image =
-        inspect_notification_image(notification.image.as_ref(), MAX_NOTIFICATION_IMAGE_BYTES)?;
-    let frame = wire::Notification {
-        ..encode_notification(notification)
-    };
-    let mut frame = frame;
-    frame.app_icon = icon.as_ref().map(wire_image);
-    frame.image = image.as_ref().map(wire_image);
-    let images = icon.into_iter().chain(image).collect();
-    Ok(EncodedNotification { frame, images })
-}
-
-fn wire_image(metadata: &crate::transfer::BlobMetadata) -> wire::NotificationImage {
+pub(crate) fn wire_image(
+    mime_type: &str,
+    size: u64,
+    hash: iroh_blobs::Hash,
+    ticket: &str,
+) -> wire::NotificationImage {
     wire::NotificationImage {
-        mime_type: metadata.mime_type.clone(),
-        size: metadata.size,
-        sha256: metadata.sha256.to_vec(),
+        mime_type: mime_type.to_owned(),
+        size,
+        sha256: hash.as_bytes().to_vec(),
+        ticket: ticket.to_owned(),
     }
 }
 
 /// Validates notification artwork without encoding a frame.
-pub(crate) fn validate_notification_images(
-    notification: &Notification,
-) -> Result<(), ProtocolError> {
-    inspect_notification_image(notification.app_icon.as_ref(), MAX_NOTIFICATION_ICON_BYTES)?;
-    inspect_notification_image(notification.image.as_ref(), MAX_NOTIFICATION_IMAGE_BYTES)?;
-    Ok(())
-}
-
-fn inspect_notification_image(
-    image: Option<&crate::NotificationImage>,
-    limit: u64,
-) -> Result<Option<crate::transfer::BlobMetadata>, ProtocolError> {
-    let Some(image) = image else {
-        return Ok(None);
-    };
-    let metadata =
-        crate::transfer::inspect_file(&image.mime_type, std::path::Path::new(&image.path))
-            .map_err(|_| ProtocolError::InvalidNotification("image"))?;
-    if metadata.size > limit {
-        return Err(ProtocolError::NotificationImageTooLarge);
-    }
-    Ok(Some(metadata))
-}
-
 pub(crate) fn encode_notification(notification: &Notification) -> wire::Notification {
     wire::Notification {
         id: notification.id.clone(),
@@ -367,24 +326,21 @@ pub(crate) fn encode_notification(notification: &Notification) -> wire::Notifica
 fn decode_notification_image(
     image: &wire::NotificationImage,
     limit: u64,
-) -> Result<crate::transfer::BlobMetadata, ProtocolError> {
-    crate::transfer::validate_mime_type(&image.mime_type)
+) -> Result<BlobTicket, ProtocolError> {
+    validate_mime_type(&image.mime_type)
         .map_err(|_| ProtocolError::InvalidNotification("image"))?;
-    crate::transfer::validate_size(image.size)
-        .map_err(|_| ProtocolError::InvalidNotification("image"))?;
+    if image.size == 0 {
+        return Err(ProtocolError::InvalidNotification("image"));
+    }
     if image.size > limit {
         return Err(ProtocolError::NotificationImageTooLarge);
     }
-    let sha256: [u8; 32] = image
-        .sha256
-        .as_slice()
-        .try_into()
-        .map_err(|_| ProtocolError::InvalidNotification("image"))?;
-    Ok(crate::transfer::BlobMetadata {
-        mime_type: image.mime_type.clone(),
-        size: image.size,
-        sha256,
-    })
+    let ticket = BlobTicket::from_str(&image.ticket)
+        .map_err(|_| ProtocolError::InvalidNotification("image ticket"))?;
+    if ticket.recursive() || ticket.hash().as_bytes() != image.sha256.as_slice() {
+        return Err(ProtocolError::InvalidNotification("image ticket"));
+    }
+    Ok(ticket)
 }
 
 /// Decodes notification metadata and returns the images to read next.
@@ -488,7 +444,54 @@ pub(crate) fn message_name(body: &wire::control_frame::Body) -> &'static str {
         wire::control_frame::Body::MediaSnapshot(_) => "media snapshot",
         wire::control_frame::Body::MediaCommand(_) => "media command",
         wire::control_frame::Body::NotificationActionActivated(_) => "notification action",
+        wire::control_frame::Body::FileOffer(_) => "file offer",
     }
+}
+
+/// Validated offer fields received from a trusted peer.
+#[derive(Debug)]
+pub(crate) struct DecodedFileOffer {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) ticket: String,
+}
+
+/// Encodes a local file share as an offer frame.
+pub(crate) fn encode_file_offer(offer: &crate::FileShare) -> wire::FileOffer {
+    wire::FileOffer {
+        id: offer.id.clone(),
+        name: offer.name.clone(),
+        size: offer.size,
+        ticket: offer.ticket.clone(),
+    }
+}
+
+/// Decodes an offer from a trusted peer and verifies its ticket shape.
+pub(crate) fn decode_file_offer(offer: wire::FileOffer) -> Result<DecodedFileOffer, ProtocolError> {
+    if offer.id.is_empty() || offer.id.len() > 128 {
+        return Err(ProtocolError::InvalidFileOffer("id"));
+    }
+    if offer.name.is_empty() || offer.name.len() > 255 {
+        return Err(ProtocolError::InvalidFileOffer("name"));
+    }
+    if offer.size == 0 {
+        return Err(ProtocolError::InvalidFileOffer("size"));
+    }
+    if offer.ticket.is_empty() || offer.ticket.len() > 4096 {
+        return Err(ProtocolError::InvalidFileOffer("ticket"));
+    }
+    let ticket = BlobTicket::from_str(&offer.ticket)
+        .map_err(|_| ProtocolError::InvalidFileOffer("ticket"))?;
+    if ticket.recursive() {
+        return Err(ProtocolError::InvalidFileOffer("ticket"));
+    }
+    Ok(DecodedFileOffer {
+        id: offer.id,
+        name: offer.name,
+        size: offer.size,
+        ticket: offer.ticket,
+    })
 }
 
 #[cfg(test)]
@@ -496,6 +499,7 @@ mod test;
 
 pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_CLIPBOARD_MIME_LENGTH: usize = 255;
+pub(crate) const MAX_CLIPBOARD_BLOB_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Converts a text clipboard payload into its wire representation.
 pub(crate) fn encode_clipboard_text(
@@ -517,16 +521,20 @@ pub(crate) fn encode_clipboard_text(
     })
 }
 
-/// Converts blob metadata into its wire representation.
+/// Converts a blob ticket into its clipboard wire representation.
 pub(crate) fn encode_clipboard_blob(
-    metadata: &crate::transfer::BlobMetadata,
+    mime_type: &str,
+    size: u64,
+    hash: iroh_blobs::Hash,
+    ticket: &str,
 ) -> Result<wire::ClipboardItem, ProtocolError> {
-    validate_clipboard_common(&metadata.mime_type)?;
+    validate_clipboard_common(mime_type)?;
     Ok(wire::ClipboardItem {
-        mime_type: metadata.mime_type.clone(),
+        mime_type: mime_type.to_owned(),
         payload: Some(ClipboardPayload::Blob(wire::ClipboardBlob {
-            size: metadata.size,
-            sha256: metadata.sha256.to_vec(),
+            size,
+            sha256: hash.as_bytes().to_vec(),
+            ticket: ticket.to_owned(),
         })),
     })
 }
@@ -539,8 +547,7 @@ pub(crate) enum ClipboardMetadata {
     },
     Blob {
         mime_type: String,
-        size: u64,
-        sha256: [u8; 32],
+        ticket: BlobTicket,
     },
 }
 
@@ -562,17 +569,17 @@ pub(crate) fn decode_clipboard_item(
             if item.mime_type.starts_with("text/plain") {
                 return Err(ProtocolError::ClipboardPayloadMismatch);
             }
-            crate::transfer::validate_size(blob.size)
-                .map_err(|_| ProtocolError::InvalidClipboard("blob size"))?;
-            let sha256: [u8; 32] = blob
-                .sha256
-                .as_slice()
-                .try_into()
-                .map_err(|_| ProtocolError::InvalidClipboard("blob sha256"))?;
+            if blob.size == 0 {
+                return Err(ProtocolError::InvalidClipboard("blob size"));
+            }
+            let ticket = BlobTicket::from_str(&blob.ticket)
+                .map_err(|_| ProtocolError::InvalidClipboard("blob ticket"))?;
+            if ticket.recursive() || ticket.hash().as_bytes() != blob.sha256.as_slice() {
+                return Err(ProtocolError::InvalidClipboard("blob ticket"));
+            }
             Ok(ClipboardMetadata::Blob {
                 mime_type: item.mime_type,
-                size: blob.size,
-                sha256,
+                ticket,
             })
         }
         None => Err(ProtocolError::ClipboardPayloadMismatch),
@@ -580,9 +587,20 @@ pub(crate) fn decode_clipboard_item(
 }
 
 fn validate_clipboard_common(mime_type: &str) -> Result<(), ProtocolError> {
-    crate::transfer::validate_mime_type(mime_type)
-        .map_err(|_| ProtocolError::InvalidClipboard("mime type"))?;
+    validate_mime_type(mime_type).map_err(|_| ProtocolError::InvalidClipboard("mime type"))?;
     if mime_type.len() > MAX_CLIPBOARD_MIME_LENGTH {
+        return Err(ProtocolError::InvalidClipboard("mime type"));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_mime_type(mime_type: &str) -> Result<(), ProtocolError> {
+    if mime_type.is_empty()
+        || mime_type.len() > 255
+        || mime_type.trim() != mime_type
+        || !mime_type.contains('/')
+        || mime_type.chars().any(char::is_control)
+    {
         return Err(ProtocolError::InvalidClipboard("mime type"));
     }
     Ok(())
@@ -595,6 +613,7 @@ pub(crate) struct MediaPlayerState {
     pub(crate) name: String,
     pub(crate) status: crate::PlaybackStatus,
     pub(crate) metadata: crate::MediaMetadata,
+    pub(crate) artwork: Option<MediaArtworkRef>,
     pub(crate) capabilities: crate::MediaCapabilities,
     pub(crate) position_ms: Option<u64>,
 }
@@ -603,33 +622,84 @@ const MAX_MEDIA_ID_LENGTH: usize = 256;
 const MAX_MEDIA_NAME_LENGTH: usize = 256;
 const MAX_MEDIA_TEXT_LENGTH: usize = 512;
 const MAX_MEDIA_ART_URL_LENGTH: usize = 4096;
+const MAX_MEDIA_ARTWORK_BYTES: u64 = 4 * 1024 * 1024;
 
-pub(crate) fn encode_media_snapshot(players: &[crate::MediaPlayer]) -> wire::MediaSnapshot {
+/// Decoded artwork reference carried in a media snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaArtworkRef {
+    pub(crate) mime_type: String,
+    pub(crate) ticket: iroh_blobs::ticket::BlobTicket,
+}
+
+fn decode_media_artwork(artwork: wire::MediaArtwork) -> Result<MediaArtworkRef, ProtocolError> {
+    validate_mime_type(&artwork.mime_type)
+        .map_err(|_| ProtocolError::InvalidMedia("artwork mime type"))?;
+    if !artwork.mime_type.starts_with("image/") {
+        return Err(ProtocolError::InvalidMedia("artwork mime type"));
+    }
+    if artwork.size == 0 || artwork.size > MAX_MEDIA_ARTWORK_BYTES {
+        return Err(ProtocolError::InvalidMedia("artwork size"));
+    }
+    let ticket = iroh_blobs::ticket::BlobTicket::from_str(&artwork.ticket)
+        .map_err(|_| ProtocolError::InvalidMedia("artwork ticket"))?;
+    if ticket.recursive() || ticket.hash().as_bytes() != artwork.sha256.as_slice() {
+        return Err(ProtocolError::InvalidMedia("artwork ticket"));
+    }
+    Ok(MediaArtworkRef {
+        mime_type: artwork.mime_type,
+        ticket,
+    })
+}
+
+/// One player plus optional artwork ticket to encode into the snapshot.
+pub(crate) struct MediaSnapshotEntry<'a> {
+    pub(crate) player: &'a crate::MediaPlayer,
+    pub(crate) artwork: Option<crate::protocol::MediaArtworkWire>,
+}
+
+/// Artwork already imported into the blob store, ready to describe on the wire.
+pub(crate) struct MediaArtworkWire {
+    pub(crate) mime_type: String,
+    pub(crate) size: u64,
+    pub(crate) hash: iroh_blobs::Hash,
+    pub(crate) ticket: String,
+}
+
+pub(crate) fn encode_media_snapshot(players: &[MediaSnapshotEntry<'_>]) -> wire::MediaSnapshot {
     let players = players
         .iter()
-        .filter(|player| player.origin == crate::MediaOrigin::Local)
-        .map(|player| wire::MediaState {
-            player_id: player.id.clone(),
-            name: player.name.clone(),
-            status: wire_status(player.status).into(),
-            metadata: Some(wire::MediaMetadata {
-                title: player.metadata.title.clone(),
-                artist: player.metadata.artist.clone(),
-                album: player.metadata.album.clone(),
-                art_url: player.metadata.art_url.clone(),
-                duration_ms: player.metadata.duration_ms.unwrap_or_default(),
-                has_duration: player.metadata.duration_ms.is_some(),
-            }),
-            capabilities: Some(wire::MediaCapabilities {
-                can_play: player.capabilities.supports(crate::MediaCommand::Play)
-                    || player.capabilities.supports(crate::MediaCommand::PlayPause),
-                can_pause: player.capabilities.supports(crate::MediaCommand::Pause)
-                    || player.capabilities.supports(crate::MediaCommand::PlayPause),
-                can_go_next: player.capabilities.supports(crate::MediaCommand::Next),
-                can_go_previous: player.capabilities.supports(crate::MediaCommand::Previous),
-            }),
-            position_ms: player.position_ms.unwrap_or_default(),
-            has_position: player.position_ms.is_some(),
+        .filter(|entry| entry.player.origin == crate::MediaOrigin::Local)
+        .map(|entry| {
+            let player = entry.player;
+            wire::MediaState {
+                player_id: player.id.clone(),
+                name: player.name.clone(),
+                status: wire_status(player.status).into(),
+                metadata: Some(wire::MediaMetadata {
+                    title: player.metadata.title.clone(),
+                    artist: player.metadata.artist.clone(),
+                    album: player.metadata.album.clone(),
+                    art_url: player.metadata.art_url.clone(),
+                    duration_ms: player.metadata.duration_ms.unwrap_or_default(),
+                    has_duration: player.metadata.duration_ms.is_some(),
+                    artwork: entry.artwork.as_ref().map(|artwork| wire::MediaArtwork {
+                        mime_type: artwork.mime_type.clone(),
+                        size: artwork.size,
+                        sha256: artwork.hash.as_bytes().to_vec(),
+                        ticket: artwork.ticket.clone(),
+                    }),
+                }),
+                capabilities: Some(wire::MediaCapabilities {
+                    can_play: player.capabilities.supports(crate::MediaCommand::Play)
+                        || player.capabilities.supports(crate::MediaCommand::PlayPause),
+                    can_pause: player.capabilities.supports(crate::MediaCommand::Pause)
+                        || player.capabilities.supports(crate::MediaCommand::PlayPause),
+                    can_go_next: player.capabilities.supports(crate::MediaCommand::Next),
+                    can_go_previous: player.capabilities.supports(crate::MediaCommand::Previous),
+                }),
+                position_ms: player.position_ms.unwrap_or_default(),
+                has_position: player.position_ms.is_some(),
+            }
         })
         .collect();
     wire::MediaSnapshot { players }
@@ -667,6 +737,7 @@ fn decode_media_player(player: wire::MediaState) -> Result<MediaPlayerState, Pro
     if metadata.art_url.len() > MAX_MEDIA_ART_URL_LENGTH {
         return Err(ProtocolError::InvalidMedia("art url"));
     }
+    let artwork = metadata.artwork.map(decode_media_artwork).transpose()?;
     let capabilities = player
         .capabilities
         .ok_or(ProtocolError::InvalidMedia("capabilities"))?;
@@ -683,8 +754,10 @@ fn decode_media_player(player: wire::MediaState) -> Result<MediaPlayerState, Pro
             artist: metadata.artist,
             album: metadata.album,
             art_url: metadata.art_url,
+            artwork: None,
             duration_ms: metadata.has_duration.then_some(metadata.duration_ms),
         },
+        artwork,
         capabilities: capabilities_from_wire(capabilities),
         position_ms: player.has_position.then_some(player.position_ms),
     })

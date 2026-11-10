@@ -19,6 +19,9 @@ public interface MistController : AutoCloseable {
     /** Reads the focused app clipboard and sends it to the selected devices. */
     public suspend fun sendClipboard(targets: List<String> = emptyList())
 
+    /** Offers a local file to the selected devices. */
+    public suspend fun shareFile(path: String, targets: List<String> = emptyList())
+
     /** Receives clipboard content applied by the background service. */
     public fun subscribeClipboard(onReceived: (ClipboardContent) -> Unit): AutoCloseable
 }

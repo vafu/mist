@@ -125,6 +125,7 @@ pub(crate) fn local_player(device: &crate::DeviceInfo, player: &LocalPlayer) -> 
         origin: MediaOrigin::Local,
         status: player.status,
         metadata: player.metadata.clone(),
+        artwork_path: None,
         capabilities: mist_app_contract::MediaCapabilities {
             commands: player.commands.clone(),
         },

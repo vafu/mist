@@ -8,19 +8,24 @@ import android.os.Build
 public sealed interface SharePayload {
     public data class Text(val text: String) : SharePayload
     public data class Image(val uri: Uri, val mimeType: String) : SharePayload
+    public data class File(val uri: Uri, val mimeType: String) : SharePayload
 }
 
 public fun Intent.toSharePayload(): SharePayload? {
     if (action != Intent.ACTION_SEND) return null
     val mimeType = type.orEmpty()
-    if (mimeType.startsWith("image/")) {
-        val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    val stream = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+    } else {
+        @Suppress("DEPRECATION")
+        getParcelableExtra(Intent.EXTRA_STREAM)
+    }
+    if (stream != null) {
+        return if (mimeType.startsWith("image/")) {
+            SharePayload.Image(stream, mimeType)
         } else {
-            @Suppress("DEPRECATION")
-            getParcelableExtra(Intent.EXTRA_STREAM)
+            SharePayload.File(stream, mimeType.ifEmpty { "application/octet-stream" })
         }
-        if (uri != null) return SharePayload.Image(uri, mimeType)
     }
     if (mimeType.startsWith("text/") || mimeType.isEmpty()) {
         val text = getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()

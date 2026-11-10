@@ -152,6 +152,7 @@ pub(crate) fn remote_player(
         origin: MediaOrigin::Remote,
         status: player.status,
         metadata: player.metadata.clone(),
+        artwork_path: None,
         capabilities: player.capabilities.clone(),
         position_ms: player.position_ms,
     }

@@ -28,7 +28,7 @@ impl NotificationChannel for IrohNotificationChannel {
         notification: Notification,
         targets: Vec<String>,
     ) -> Result<(), NotificationError> {
-        self.session.push_notification(&notification, targets)
+        self.session.push_notification(&notification, targets).await
     }
 
     fn subscribe(&self) -> Arc<dyn NotificationEventStream> {

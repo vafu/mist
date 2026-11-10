@@ -24,6 +24,7 @@ pub struct ReceivedClipboard {
     pub source_endpoint_id: String,
     pub source_device: DeviceInfo,
     pub content: ClipboardContent,
+    /// BLAKE3 content identifier. The field name is retained for binding compatibility.
     pub sha256: String,
 }
 

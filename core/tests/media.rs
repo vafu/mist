@@ -83,11 +83,21 @@ fn player(id: &str, title: &str) -> LocalPlayer {
             artist: "Artist".to_owned(),
             album: "Album".to_owned(),
             art_url: String::new(),
+            artwork: None,
             duration_ms: Some(180_000),
         },
         commands: vec![MediaCommand::Play, MediaCommand::Pause, MediaCommand::Next],
         position_ms: Some(1_000),
     }
+}
+
+fn player_with_artwork(id: &str, title: &str, path: &std::path::Path) -> LocalPlayer {
+    let mut player = player(id, title);
+    player.metadata.artwork = Some(mist_app_contract::MediaArtwork {
+        mime_type: "image/png".to_owned(),
+        path: path.to_string_lossy().into_owned(),
+    });
+    player
 }
 
 async fn runtime_with_media(
@@ -201,4 +211,47 @@ async fn media_events_report_added_then_removed() {
     assert!(saw_added, "expected an Added event for the local player");
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn media_artwork_crosses_the_wire() {
+    let phone_dir = TempDir::new().unwrap();
+    let laptop_dir = TempDir::new().unwrap();
+    let artwork_path = phone_dir.path().join("cover.png");
+    let artwork = (0_u32..4000)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+    std::fs::write(&artwork_path, &artwork).unwrap();
+
+    let backend = FakeMedia::new(vec![player_with_artwork("p1", "Art", &artwork_path)]);
+    let phone = runtime_with_media(&phone_dir, "phone", backend).await;
+    let laptop = MistFactory::new(laptop_dir.path(), device("laptop"))
+        .unwrap()
+        .local_only()
+        .create()
+        .await
+        .unwrap();
+    pair(&phone, &laptop).await;
+
+    let mut remote = None;
+    for _ in 0..100 {
+        let found = laptop
+            .media()
+            .list()
+            .into_iter()
+            .find(|player| player.origin == MediaOrigin::Remote);
+        if let Some(player) = found
+            && player.artwork_path.is_some()
+        {
+            remote = Some(player);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let remote = remote.expect("remote player with artwork never appeared");
+    let path = remote.artwork_path.expect("artwork path missing");
+    assert_eq!(std::fs::read(path).unwrap(), artwork);
+
+    phone.shutdown().await;
+    laptop.shutdown().await;
 }

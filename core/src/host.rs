@@ -85,7 +85,9 @@ impl MistFactory {
                 .secret_key(SecretKey::from_bytes(&identity))
                 .address_lookup(lookup)
                 .state_store(store)
-                .blob_directory(storage_directory.as_ref().join("clipboard")),
+                .blob_directory(storage_directory.as_ref().join("clipboard"))
+                .file_store_directory(storage_directory.as_ref().join("files"))
+                .file_inbox_directory(default_inbox_directory()),
             media: None,
             media_handler: None,
         })
@@ -116,6 +118,15 @@ impl MistFactory {
     #[must_use]
     pub fn media(mut self, provider: Arc<dyn MediaProvider>) -> Self {
         self.media = Some(provider);
+        self
+    }
+
+    /// Sets the directory where accepted incoming files are stored.
+    ///
+    /// Without an inbox, incoming offers can be listed but not accepted.
+    #[must_use]
+    pub fn file_inbox_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.builder = self.builder.file_inbox_directory(directory);
         self
     }
 
@@ -153,6 +164,30 @@ impl MistFactory {
     }
 }
 
+fn default_inbox_directory() -> PathBuf {
+    default_inbox_for(std::env::var_os("HOME"))
+}
+
+fn default_inbox_for(home: Option<std::ffi::OsString>) -> PathBuf {
+    home.map_or_else(
+        || PathBuf::from("Downloads/mist"),
+        |home| PathBuf::from(home).join("Downloads/mist"),
+    )
+}
+
+#[cfg(test)]
+mod test {
+    use super::default_inbox_for;
+
+    #[test]
+    fn default_inbox_is_under_the_home_downloads_directory() {
+        assert_eq!(
+            default_inbox_for(Some("/home/alice".into())),
+            std::path::PathBuf::from("/home/alice/Downloads/mist")
+        );
+    }
+}
+
 /// Creates the default persistent runtime for generated mobile bindings.
 ///
 /// The platform passes an app-private directory. The database and cryptographic
@@ -168,7 +203,9 @@ pub async fn create_mist_app(
     device_info: DeviceInfo,
 ) -> Result<Arc<dyn MistApp>, StartupError> {
     executor::run(async move {
-        MistFactory::new(PathBuf::from(storage_directory), device_info)?
+        let storage_directory = PathBuf::from(storage_directory);
+        MistFactory::new(&storage_directory, device_info)?
+            .file_inbox_directory(storage_directory.join("inbox"))
             .create()
             .await
     })
@@ -194,7 +231,9 @@ pub async fn create_mist_app_with_media(
 ) -> Result<Arc<dyn MistApp>, StartupError> {
     let handler: Arc<dyn MediaCommandHandler> = Arc::from(handler);
     executor::run(async move {
-        MistFactory::new(PathBuf::from(storage_directory), device_info)?
+        let storage_directory = PathBuf::from(storage_directory);
+        MistFactory::new(&storage_directory, device_info)?
+            .file_inbox_directory(storage_directory.join("inbox"))
             .media_command_handler(handler)
             .create()
             .await

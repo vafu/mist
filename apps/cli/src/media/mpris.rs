@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use mist_app_contract::{MediaCommand, MediaMetadata, PlaybackStatus};
+use mist_app_contract::{MediaArtwork, MediaCommand, MediaMetadata, PlaybackStatus};
 use mist_core::host::{LocalPlayer, MediaProvider, MediaProviderError, MediaWatcher};
 use zbus::zvariant::OwnedValue;
 use zbus::{Connection, MatchRule, MessageStream, Proxy};
@@ -258,6 +259,7 @@ async fn read_player(connection: &Connection, player_id: &str) -> Result<LocalPl
             artist: metadata_string_list(&metadata, "xesam:artist"),
             album: metadata_string(&metadata, "xesam:album"),
             art_url: metadata_string(&metadata, "mpris:artUrl"),
+            artwork: local_file_artwork(&metadata),
             duration_ms: metadata_i64(&metadata, "mpris:length")
                 .and_then(|value| u64::try_from(value / 1000).ok()),
         },
@@ -271,6 +273,19 @@ fn metadata_string(metadata: &HashMap<String, OwnedValue>, key: &str) -> String 
         .get(key)
         .and_then(|value| <&str>::try_from(value).ok())
         .map_or_else(String::new, ToOwned::to_owned)
+}
+
+/// Resolves a local `file://` MPRIS artwork URL into a shared blob source.
+///
+/// Remote `http(s)` URLs are left in `art_url` and passed to peers as a URL,
+/// because fetching arbitrary URLs is not the runtime's responsibility.
+fn local_file_artwork(metadata: &HashMap<String, OwnedValue>) -> Option<MediaArtwork> {
+    let url = metadata_string(metadata, "mpris:artUrl");
+    let path = PathBuf::from(url.strip_prefix("file://")?);
+    (!path.as_os_str().is_empty() && path.is_file()).then(|| MediaArtwork {
+        mime_type: "image/png".to_owned(),
+        path: path.to_string_lossy().into_owned(),
+    })
 }
 
 fn metadata_string_list(metadata: &HashMap<String, OwnedValue>, key: &str) -> String {

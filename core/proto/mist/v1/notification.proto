@@ -34,7 +34,10 @@ message NotificationActionActivated {
 message NotificationImage {
   string mime_type = 1;
   uint64 size = 2;
+  // BLAKE3 content hash. Field name retained for wire compatibility.
   bytes sha256 = 3;
+  // iroh-blobs ticket for the image. Content is pulled from the sender.
+  string ticket = 4;
 }
 
 // Platform classification of a notification. Values are wire-stable.

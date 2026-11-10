@@ -120,6 +120,29 @@ public class AndroidMistController(context: Context) : MistController {
         }
     }
 
+    override suspend fun shareFile(path: String, targets: List<String>) {
+        request { remote, callback ->
+            remote.shareFile(path, targets.toTypedArray(), callback)
+        }
+    }
+
+    /** Copies a picked document into app-private cache before sharing it. */
+    public suspend fun cacheSharedFile(uri: Uri, displayName: String?): String? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val directory = File(applicationContext.cacheDir, "files/out").apply { mkdirs() }
+                val name = displayName
+                    ?.substringAfterLast('/')
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "shared-${System.currentTimeMillis()}"
+                val target = File(directory, name)
+                applicationContext.contentResolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                } ?: return@withContext null
+                target.absolutePath
+            }.getOrNull()
+        }
+
     override fun subscribeClipboard(onReceived: (ClipboardContent) -> Unit): AutoCloseable {
         val receiver: (Bundle) -> Unit = { bundle ->
             val content = bundle.getBundle(KEY_CLIPBOARD_CONTENT)?.toClipboardContent()

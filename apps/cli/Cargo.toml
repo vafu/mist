@@ -22,6 +22,7 @@ path = "src/lib.rs"
 async-trait = "=0.1.89"
 futures-util.workspace = true
 iroh.workspace = true
+image.workspace = true
 mist-core = { path = "../../core" }
 mist-app-contract = { path = "../../core/app-contract" }
 qrcode.workspace = true

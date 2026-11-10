@@ -34,6 +34,7 @@ public fun MistApp(
     notificationListenerGranted: Boolean,
     requestNotificationPosting: () -> Unit,
     requestNotificationListener: () -> Unit,
+    pickAndShareFile: () -> Unit,
 ) {
     val state by controller.state.collectAsState()
     var pairingOffer by remember { mutableStateOf("") }
@@ -125,6 +126,12 @@ public fun MistApp(
                 }
 
                 if (state.devices.isNotEmpty()) {
+                    Button(
+                        enabled = !isPairing,
+                        onClick = pickAndShareFile,
+                    ) {
+                        Text("Share file")
+                    }
                     Button(
                         enabled = !isPairing,
                         onClick = {

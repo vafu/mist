@@ -42,8 +42,20 @@ pub struct MediaMetadata {
     pub album: String,
     /// Remote artwork reference; empty when none is available.
     pub art_url: String,
+    /// Local artwork file published to peers; `None` when unavailable.
+    pub artwork: Option<MediaArtwork>,
     /// Track length in milliseconds; `None` when unknown.
     pub duration_ms: Option<u64>,
+}
+
+/// Artwork attached to the currently loaded media.
+///
+/// `path` is an absolute path to a regular image file the caller owns. The
+/// runtime streams it to peers; the path never crosses the network.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct MediaArtwork {
+    pub mime_type: String,
+    pub path: String,
 }
 
 /// Transport operations supported by a player.
@@ -75,6 +87,8 @@ pub struct MediaPlayer {
     pub origin: MediaOrigin,
     pub status: PlaybackStatus,
     pub metadata: MediaMetadata,
+    /// Local artwork file received from a peer; `None` for local players.
+    pub artwork_path: Option<String>,
     pub capabilities: MediaCapabilities,
     /// Position in milliseconds; `None` when unknown.
     pub position_ms: Option<u64>,

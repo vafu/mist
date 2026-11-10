@@ -71,7 +71,13 @@ pub trait Mist {
     /// Sends a notification to selected devices.
     ///
     /// An empty `image_path` means no artwork.
-    fn push_notification(&self, title: &str, body: &str, image_path: &str) -> zbus::Result<()>;
+    fn push_notification(
+        &self,
+        title: &str,
+        body: &str,
+        image_path: &str,
+        targets: Vec<String>,
+    ) -> zbus::Result<()>;
 
     /// Current media players, local and remote.
     #[zbus(property)]
@@ -81,10 +87,18 @@ pub trait Mist {
     fn media_command(&self, player_id: &str, command: &str) -> zbus::Result<()>;
 
     /// Sends text clipboard content to selected devices.
-    fn push_clipboard_text(&self, text: &str) -> zbus::Result<()>;
+    fn push_clipboard_text(&self, text: &str, targets: Vec<String>) -> zbus::Result<()>;
 
     /// Sends a local file as clipboard content to selected devices.
-    fn push_clipboard_blob(&self, path: &str, mime_type: &str) -> zbus::Result<()>;
+    fn push_clipboard_blob(
+        &self,
+        path: &str,
+        mime_type: &str,
+        targets: Vec<String>,
+    ) -> zbus::Result<()>;
+
+    /// Offers a local file to the selected devices.
+    fn share_file(&self, path: &str, targets: Vec<String>) -> zbus::Result<()>;
 
     /// Requests an orderly daemon shutdown.
     fn shutdown(&self) -> zbus::Result<()>;

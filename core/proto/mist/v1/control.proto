@@ -7,6 +7,7 @@ import "mist/v1/session.proto";
 import "mist/v1/notification.proto";
 import "mist/v1/clipboard.proto";
 import "mist/v1/media.proto";
+import "mist/v1/transfer.proto";
 
 // One length-delimited message on Mist's control stream.
 message ControlFrame {
@@ -22,5 +23,6 @@ message ControlFrame {
     MediaSnapshot media_snapshot = 9;
     MediaCommandRequest media_command = 10;
     NotificationActionActivated notification_action_activated = 11;
+    FileOffer file_offer = 12;
   }
 }

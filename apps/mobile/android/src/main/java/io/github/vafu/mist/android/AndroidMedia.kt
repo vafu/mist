@@ -5,6 +5,7 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import io.github.vafu.mist.core.MediaCapabilities
+import io.github.vafu.mist.core.MediaArtwork
 import io.github.vafu.mist.core.MediaCommand
 import io.github.vafu.mist.core.MediaMetadata
 import io.github.vafu.mist.core.PlaybackStatus
@@ -55,7 +56,12 @@ public class AndroidMedia(private val service: MistRuntimeService) {
     }
 
     private fun publish(controllers: List<MediaController>?) {
-        val players = controllers.orEmpty().mapNotNull(::snapshot)
+        // Skip our own exported session; re-importing it would publish a remote
+        // player back to peers as if it were local.
+        val players = controllers
+            .orEmpty()
+            .filter { it.packageName != service.packageName }
+            .mapNotNull(::snapshot)
         service.onLocalMediaChanged(players)
         registerCallbacks(controllers.orEmpty())
     }
@@ -114,6 +120,7 @@ public class AndroidMedia(private val service: MistRuntimeService) {
                     ?: "",
                 album = metadata?.getString(android.media.MediaMetadata.METADATA_KEY_ALBUM) ?: "",
                 artUrl = "",
+                artwork = artwork(metadata, controller),
                 durationMs = metadata
                     ?.getLong(android.media.MediaMetadata.METADATA_KEY_DURATION)
                     ?.takeIf { it > 0 }
@@ -123,6 +130,34 @@ public class AndroidMedia(private val service: MistRuntimeService) {
             positionMs = playback.position.takeIf { it >= 0 }?.toULong(),
             token = controller.sessionToken?.toString() ?: controller.packageName,
         )
+    }
+
+    /**
+     * Writes the session's artwork bitmap to a private cache file.
+     *
+     * MediaSession exposes artwork as a Bitmap, not bytes; the runtime needs a
+     * file path so it can import and share it as a blob.
+     */
+    private fun artwork(
+        metadata: android.media.MediaMetadata?,
+        controller: MediaController,
+    ): MediaArtwork? {
+        val bitmap = metadata?.getBitmap(android.media.MediaMetadata.METADATA_KEY_ALBUM_ART)
+            ?: metadata?.getBitmap(android.media.MediaMetadata.METADATA_KEY_ART)
+            ?: metadata?.getBitmap(android.media.MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+            ?: return null
+        val directory = java.io.File(service.cacheDir, "media-artwork").apply { mkdirs() }
+        val target = java.io.File(
+            directory,
+            "art-${(controller.sessionToken?.toString() ?: controller.packageName).hashCode()}.png",
+        )
+        val written = runCatching {
+            target.outputStream().use { output ->
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output)
+            }
+        }.getOrDefault(false)
+        if (!written) return null
+        return MediaArtwork(mimeType = "image/png", path = target.absolutePath)
     }
 
     public suspend fun command(playerId: String, command: MediaCommand) {

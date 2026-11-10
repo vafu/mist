@@ -104,15 +104,20 @@ fn media_snapshot_and_command_round_trip() {
             artist: "Artist".to_owned(),
             album: "Album".to_owned(),
             art_url: "https://example.invalid/art.png".to_owned(),
+            artwork: None,
             duration_ms: Some(123_000),
         },
         capabilities: MediaCapabilities {
             commands: vec![MediaCommand::Play, MediaCommand::Pause, MediaCommand::Next],
         },
+        artwork_path: None,
         position_ms: Some(4_000),
     };
 
-    let snapshot = super::encode_media_snapshot(&[player]);
+    let snapshot = super::encode_media_snapshot(&[super::MediaSnapshotEntry {
+        player: &player,
+        artwork: None,
+    }]);
     let decoded = super::decode_media_snapshot(snapshot).unwrap();
     assert_eq!(decoded.len(), 1);
     let state = &decoded[0];
@@ -146,6 +151,7 @@ fn media_snapshot_rejects_empty_player_ids() {
                 art_url: String::new(),
                 duration_ms: 0,
                 has_duration: false,
+                artwork: None,
             }),
             capabilities: Some(MediaCapabilities {
                 can_play: true,

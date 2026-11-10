@@ -201,6 +201,14 @@ private fun MediaPlayer.toPlatformMetadata(): PlatformMetadata =
             metadata.durationMs?.let {
                 putLong(PlatformMetadata.METADATA_KEY_DURATION, it.toLong())
             }
+            artworkPath?.let { path ->
+                runCatching {
+                    android.graphics.BitmapFactory.decodeFile(path)
+                }.getOrNull()?.let { bitmap ->
+                    putBitmap(PlatformMetadata.METADATA_KEY_ALBUM_ART, bitmap)
+                    putBitmap(PlatformMetadata.METADATA_KEY_ART, bitmap)
+                }
+            }
         }
         .build()
 

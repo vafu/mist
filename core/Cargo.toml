@@ -9,27 +9,20 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-probe = []
-
-[[bin]]
-name = "mist-blob-probe"
-path = "src/bin/blob_probe.rs"
-required-features = ["probe"]
-
 [dependencies]
 async-trait = "=0.1.89"
 base64.workspace = true
 getrandom.workspace = true
 futures-util.workspace = true
 iroh.workspace = true
+iroh-blobs.workspace = true
+blake3 = "=1.8.7"
 iroh-base.workspace = true
 iroh-tickets.workspace = true
 mist-app-contract = { path = "app-contract" }
 n0-future.workspace = true
 prost.workspace = true
 rusqlite.workspace = true
-sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

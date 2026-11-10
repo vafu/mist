@@ -10,6 +10,7 @@ mod device;
 mod media;
 mod notification;
 mod pairing;
+mod transfer;
 
 pub use app::MistApp;
 pub use clipboard::{
@@ -20,8 +21,9 @@ pub use device::{
     DeviceEventStream, DeviceInfo, DeviceManager, DeviceStatus, ManagedDevice, Platform,
 };
 pub use media::{
-    Media, MediaCapabilities, MediaCommand, MediaCommandHandler, MediaError, MediaEvent,
-    MediaEventKind, MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer, PlaybackStatus,
+    Media, MediaArtwork, MediaCapabilities, MediaCommand, MediaCommandHandler, MediaError,
+    MediaEvent, MediaEventKind, MediaEventStream, MediaMetadata, MediaOrigin, MediaPlayer,
+    PlaybackStatus,
 };
 pub use notification::{
     ActivatedNotificationAction, Notification, NotificationAction, NotificationActivationStream,
@@ -29,5 +31,9 @@ pub use notification::{
     NotificationKind, ReceivedNotification,
 };
 pub use pairing::{PairedPeer, Pairing, PairingError, PairingOffer};
+pub use transfer::{
+    FileInboxStream, FileOffer, FileOfferStream, FileShare, FileTransfer, ReceivedFile,
+    TransferError,
+};
 
 uniffi::setup_scaffolding!();

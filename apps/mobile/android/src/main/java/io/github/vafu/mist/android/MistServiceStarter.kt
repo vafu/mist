@@ -18,6 +18,7 @@ internal object MistServiceStarter {
     private const val EXTRA_SHARE_TEXT: String = "share_text"
     private const val EXTRA_SHARE_URI: String = "share_uri"
     private const val EXTRA_SHARE_MIME_TYPE: String = "share_mime_type"
+    private const val EXTRA_SHARE_AS_FILE: String = "share_as_file"
 
     fun serviceIntent(context: Context, action: String = ACTION_START): Intent =
         Intent(context, MistRuntimeService::class.java).setAction(action)
@@ -30,8 +31,9 @@ internal object MistServiceStarter {
         }
     }
 
-    fun shareIntent(context: Context, payload: SharePayload): Intent =
+    fun shareIntent(context: Context, payload: SharePayload, asFile: Boolean): Intent =
         serviceIntent(context, ACTION_SHARE).apply {
+            putExtra(EXTRA_SHARE_AS_FILE, asFile)
             when (payload) {
                 is SharePayload.Text -> putExtra(EXTRA_SHARE_TEXT, payload.text)
                 is SharePayload.Image -> {
@@ -39,8 +41,17 @@ internal object MistServiceStarter {
                     putExtra(EXTRA_SHARE_MIME_TYPE, payload.mimeType)
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
+                is SharePayload.File -> {
+                    putExtra(EXTRA_SHARE_URI, payload.uri.toString())
+                    putExtra(EXTRA_SHARE_MIME_TYPE, payload.mimeType)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
             }
         }
+
+    /** Whether this share should be sent as a file rather than clipboard content. */
+    fun shareAsFile(intent: Intent): Boolean =
+        intent.getBooleanExtra(EXTRA_SHARE_AS_FILE, false)
 
     fun sharePayload(intent: Intent): SharePayload? {
         if (intent.action != ACTION_SHARE) return null
@@ -49,7 +60,11 @@ internal object MistServiceStarter {
         }
         val uri = intent.getStringExtra(EXTRA_SHARE_URI) ?: return null
         val mimeType = intent.getStringExtra(EXTRA_SHARE_MIME_TYPE) ?: return null
-        return SharePayload.Image(android.net.Uri.parse(uri), mimeType)
+        return if (mimeType.startsWith("image/")) {
+            SharePayload.Image(android.net.Uri.parse(uri), mimeType)
+        } else {
+            SharePayload.File(android.net.Uri.parse(uri), mimeType)
+        }
     }
 
     fun mediaCommandIntent(context: Context, command: String): Intent =

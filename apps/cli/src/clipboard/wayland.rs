@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use mist_app_contract::ClipboardContent;
-use wl_clipboard_rs::copy::{self, MimeType as CopyMimeType, Options, Source};
+use wl_clipboard_rs::copy::{self, MimeSource, MimeType as CopyMimeType, Options, Source};
 use wl_clipboard_rs::paste::{MimeType as PasteMimeType, Seat};
 use wl_clipboard_rs::watch::{ClipboardEvent, ClipboardType as WatchClipboard, Watcher};
 
@@ -50,11 +50,11 @@ impl LocalClipboardProvider for WaylandClipboard {
     }
 
     fn apply(&self, content: &ClipboardContent) -> Result<(), LocalClipboardError> {
-        let (bytes, mime_type) = match content {
-            ClipboardContent::Text { text } => (
-                text.as_bytes().to_vec(),
-                CopyMimeType::Specific("text/plain;charset=utf-8".to_owned()),
-            ),
+        let sources = match content {
+            ClipboardContent::Text { text } => vec![MimeSource {
+                source: Source::Bytes(text.as_bytes().to_vec().into()),
+                mime_type: CopyMimeType::Specific("text/plain;charset=utf-8".to_owned()),
+            }],
             ClipboardContent::Blob { mime_type, path } => {
                 let metadata =
                     std::fs::metadata(path).map_err(|error| LocalClipboardError::Read {
@@ -66,18 +66,44 @@ impl LocalClipboardProvider for WaylandClipboard {
                 let bytes = std::fs::read(path).map_err(|error| LocalClipboardError::Read {
                     reason: error.to_string(),
                 })?;
-                (bytes, CopyMimeType::Specific(mime_type.clone()))
+                image_sources(mime_type, &bytes)
             }
         };
 
         let mut options = Options::new();
         options.clipboard(copy::ClipboardType::Regular);
-        copy::copy(options, Source::Bytes(bytes.into()), mime_type).map_err(|error| {
-            LocalClipboardError::Write {
-                reason: error.to_string(),
-            }
+        copy::copy_multi(options, sources).map_err(|error| LocalClipboardError::Write {
+            reason: error.to_string(),
         })
     }
+}
+
+/// Publishes the image under its original MIME type plus PNG.
+///
+/// Paste targets commonly request `image/png` specifically; offering only the
+/// original format (usually `image/jpeg`) makes an otherwise valid image appear
+/// missing to those clients.
+fn image_sources(mime_type: &str, bytes: &[u8]) -> Vec<MimeSource> {
+    let mut sources = vec![MimeSource {
+        source: Source::Bytes(bytes.to_owned().into()),
+        mime_type: CopyMimeType::Specific(mime_type.to_owned()),
+    }];
+    if mime_type != "image/png"
+        && let Ok(image) = image::load_from_memory(bytes)
+    {
+        let mut png = Vec::new();
+        if image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .is_ok()
+            && png.len() <= MAX_CLIPBOARD_BYTES
+        {
+            sources.push(MimeSource {
+                source: Source::Bytes(png.into()),
+                mime_type: CopyMimeType::Specific("image/png".to_owned()),
+            });
+        }
+    }
+    sources
 }
 
 struct WaylandClipboardWatcher {

@@ -56,8 +56,7 @@ impl MprisPublisher {
         let existing = self
             .published
             .lock()
-            .map(|published| published.get(&player.id).cloned())
-            .unwrap_or(None);
+            .map_or(None, |published| published.get(&player.id).cloned());
         let state = Arc::new(Mutex::new(player.clone()));
 
         if existing.is_some() {
@@ -147,13 +146,12 @@ impl SharedPlayer {
             .map(|player| player.id)
             .ok_or_else(|| zbus::fdo::Error::Failed("media state unavailable".to_owned()))?;
         let media = Arc::clone(&self.media);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-        runtime
-            .block_on(media.command(player_id, command))
-            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+        // MPRIS method handlers run on the daemon's Tokio runtime, so the
+        // command must be spawned rather than blocking on a nested runtime.
+        tokio::spawn(async move {
+            let _ = media.command(player_id, command).await;
+        });
+        Ok(())
     }
 }
 
@@ -346,7 +344,11 @@ fn metadata_map(player: &MediaPlayer) -> HashMap<String, OwnedValue> {
             metadata.insert("xesam:artist".to_owned(), owned);
         }
     }
-    insert_string(&mut metadata, "mpris:artUrl", &player.metadata.art_url);
+    let art_url = player.artwork_path.as_deref().map_or_else(
+        || player.metadata.art_url.clone(),
+        |path| format!("file://{path}"),
+    );
+    insert_string(&mut metadata, "mpris:artUrl", &art_url);
     if let Some(duration) = player.metadata.duration_ms
         && let Ok(owned) = OwnedValue::try_from(Value::from(duration.saturating_mul(1000)))
     {

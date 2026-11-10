@@ -6,16 +6,19 @@ import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.ContentValues
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.RemoteCallbackList
+import android.provider.MediaStore
 import android.util.Log
 import io.github.vafu.mist.core.ClipboardContent
 import io.github.vafu.mist.core.Clipboard
 import io.github.vafu.mist.core.DeviceClass
 import io.github.vafu.mist.core.DeviceInfo
 import io.github.vafu.mist.core.DeviceManager
+import io.github.vafu.mist.core.FileTransfer
 import io.github.vafu.mist.core.Media
 import io.github.vafu.mist.core.MediaCommandHandler
 import io.github.vafu.mist.core.MistApp
@@ -28,6 +31,7 @@ import io.github.vafu.mist.core.PairingOffer
 import io.github.vafu.mist.core.Platform
 import io.github.vafu.mist.host.createMistAppWithMedia
 import java.io.File
+import java.io.IOException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -48,6 +52,7 @@ public class MistRuntimeService : Service() {
     private var pairing: Pairing? = null
     private var notifications: MistNotificationChannel? = null
     private var clipboard: Clipboard? = null
+    private var files: FileTransfer? = null
     private var media: Media? = null
     private var androidMedia: AndroidMedia? = null
     private var mediaSession: MistMediaSession? = null
@@ -148,6 +153,17 @@ public class MistRuntimeService : Service() {
             }
         }
 
+        override fun shareFile(
+            path: String,
+            targets: Array<String>,
+            callback: IMistResultCallback,
+        ) {
+            runOperation(callback) {
+                requireFiles().share(path, targets.toList())
+                Bundle.EMPTY
+            }
+        }
+
         override fun activateNotification(
             sourceEndpointId: String,
             notificationId: String,
@@ -187,7 +203,8 @@ public class MistRuntimeService : Service() {
         }
         startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification())
         intent?.let(MistServiceStarter::sharePayload)?.let { payload ->
-            scope.launch { sendShare(payload) }
+            val asFile = intent.let(MistServiceStarter::shareAsFile)
+            scope.launch { sendShare(payload, asFile) }
         }
         if (intent?.action == MistServiceStarter.ACTION_MEDIA_COMMAND) {
             val command = intent.getStringExtra(MistServiceStarter.EXTRA_MEDIA_COMMAND)
@@ -214,21 +231,50 @@ public class MistRuntimeService : Service() {
      * A share can cold-start this service, so readiness is awaited rather than
      * assumed; failures are logged instead of being silently dropped.
      */
-    private suspend fun sendShare(payload: SharePayload) {
+    private suspend fun sendShare(payload: SharePayload, asFile: Boolean) {
         val clipboard = runtimeReady.await()
         if (clipboard == null) {
             Log.e(TAG, "Mist runtime failed to start; dropping share")
             return
         }
+        if (asFile) {
+            val uri = when (payload) {
+                is SharePayload.Text -> {
+                    Log.e(TAG, "Cannot send text as a file")
+                    return
+                }
+                is SharePayload.Image -> payload.uri
+                is SharePayload.File -> payload.uri
+            }
+            val mimeType = when (payload) {
+                is SharePayload.Text -> "text/plain"
+                is SharePayload.Image -> payload.mimeType
+                is SharePayload.File -> payload.mimeType
+            }
+            val file = copySharedFile(uri, mimeType)
+            if (file == null) {
+                Log.e(TAG, "Could not read shared file")
+                return
+            }
+            runCatching {
+                val offered = requireFiles().share(file.absolutePath, emptyList())
+                Log.i(TAG, "Offered ${offered.name} (${offered.size} bytes)")
+            }.onFailure { Log.e(TAG, "Could not share file", it) }
+            return
+        }
         val content = when (payload) {
             is SharePayload.Text -> ClipboardContent.Text(payload.text)
             is SharePayload.Image -> {
-                val file = copySharedImage(payload.uri, payload.mimeType)
+                val file = copySharedFile(payload.uri, payload.mimeType)
                 if (file == null) {
                     Log.e(TAG, "Could not read shared image")
                     return
                 }
                 ClipboardContent.Blob(payload.mimeType, file.absolutePath)
+            }
+            is SharePayload.File -> {
+                Log.e(TAG, "Files must be shared through the file transfer target")
+                return
             }
         }
         runCatching {
@@ -238,10 +284,10 @@ public class MistRuntimeService : Service() {
         }
     }
 
-    private suspend fun copySharedImage(uri: android.net.Uri, mimeType: String): File? =
+    private suspend fun copySharedFile(uri: android.net.Uri, mimeType: String): File? =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             runCatching {
-                val directory = File(cacheDir, "clipboard/out").apply { mkdirs() }
+                val directory = File(cacheDir, "files/out").apply { mkdirs() }
                 val target = File(directory, "share-${System.currentTimeMillis()}.${extension(mimeType)}")
                 contentResolver.openInputStream(uri)?.use { input ->
                     target.outputStream().use { output -> input.copyTo(output) }
@@ -282,12 +328,15 @@ public class MistRuntimeService : Service() {
             pairing = runtime.pairing()
             notifications = runtime.notificationChannel()
             clipboard = runtime.clipboard()
+            files = runtime.files()
             media = runtime.media()
             runtimeReady.complete(clipboard)
             publishSnapshot()
             scope.launch { forwardDeviceEvents() }
             scope.launch { receiveRemoteNotifications() }
             scope.launch { receiveClipboard() }
+            scope.launch { receiveFiles() }
+            scope.launch { acceptIncomingFiles() }
             androidMedia = AndroidMedia(this@MistRuntimeService).also { it.start() }
             mediaSession = MistMediaSession(this@MistRuntimeService) { playerId, command ->
                 scope.launch {
@@ -309,7 +358,12 @@ public class MistRuntimeService : Service() {
         val stream = requireDevices().subscribe()
         try {
             while (true) {
-                stream.next()
+                try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Device event stream stopped", error)
+                    return
+                }
                 publishSnapshot()
             }
         } finally {
@@ -321,7 +375,12 @@ public class MistRuntimeService : Service() {
         val stream = requireNotifications().subscribe()
         try {
             while (true) {
-                val received = stream.next()
+                val received = try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Notification event stream stopped", error)
+                    return
+                }
                 val channelId = if (received.notification.silent) {
                     REMOTE_SILENT_CHANNEL_ID
                 } else {
@@ -377,12 +436,88 @@ public class MistRuntimeService : Service() {
         val stream = requireClipboard().subscribe()
         try {
             while (true) {
-                val received = stream.next()
+                val received = try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Clipboard event stream stopped", error)
+                    return
+                }
                 applyClipboard(received.content)
                 notifyClipboardCallbacks(received)
             }
         } finally {
             stream.close()
+        }
+    }
+
+    private suspend fun receiveFiles() {
+        val stream = requireFiles().subscribeInbox()
+        try {
+            while (true) {
+                val received = try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "File inbox stream stopped", error)
+                    return
+                }
+                runCatching { publishToDownloads(received.path, received.name) }
+                    .onFailure { Log.e(TAG, "Could not publish received file", it) }
+            }
+        } finally {
+            stream.close()
+        }
+    }
+
+    /** Accepts every offered file into the inbox; publishing happens after. */
+    private suspend fun acceptIncomingFiles() {
+        val transfer = requireFiles()
+        val offers = transfer.subscribe()
+        try {
+            while (true) {
+                val offer = try {
+                    offers.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "File offer stream stopped", error)
+                    return
+                }
+                runCatching { transfer.accept(offer) }
+                    .onFailure { Log.e(TAG, "Could not accept offered file ${offer.name}", it) }
+            }
+        } finally {
+            offers.close()
+        }
+    }
+
+    private fun publishToDownloads(path: String, name: String) {
+        val source = File(path)
+        if (!source.isFile) {
+            Log.e(TAG, "Received file is missing: $path")
+            return
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name)
+            put(MediaStore.Downloads.MIME_TYPE, java.net.URLConnection.guessContentTypeFromName(name) ?: "application/octet-stream")
+            put(MediaStore.Downloads.RELATIVE_PATH, "Download/mist")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: throw IOException("could not create a Downloads entry")
+        try {
+            contentResolver.openOutputStream(uri)?.use { output ->
+                source.inputStream().use { input -> input.copyTo(output) }
+            } ?: throw IOException("could not open the Downloads entry")
+            values.clear()
+            values.put(MediaStore.Downloads.IS_PENDING, 0)
+            contentResolver.update(uri, values, null, null)
+            if (!source.delete()) {
+                Log.w(TAG, "Published file but could not remove inbox copy: ${source.path}")
+            }
+        } catch (error: Exception) {
+            runCatching { contentResolver.delete(uri, null, null) }
+            throw error
         }
     }
 
@@ -449,7 +584,12 @@ public class MistRuntimeService : Service() {
         val stream = notifications.subscribeActivations()
         try {
             while (true) {
-                val activation = stream.next()
+                val activation = try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Notification activation stream stopped", error)
+                    return
+                }
                 val bundle = Bundle().apply {
                     putString(KEY_ACTIVATION_ENDPOINT, activation.sourceEndpointId)
                     putString(KEY_ACTIVATION_NOTIFICATION, activation.notificationId)
@@ -479,7 +619,17 @@ public class MistRuntimeService : Service() {
             // Seed the session with the current player set.
             mediaSession?.update(media.list())
             while (true) {
-                stream.next()
+                val received = try {
+                    stream.next()
+                    true
+                } catch (error: io.github.vafu.mist.core.MediaException.Lagged) {
+                    Log.w(TAG, "Media event stream skipped ${error.count} updates")
+                    false
+                } catch (error: Exception) {
+                    Log.w(TAG, "Media event stream stopped", error)
+                    return
+                }
+                if (!received) continue
                 mediaSession?.update(media.list())
             }
         } finally {
@@ -516,6 +666,7 @@ public class MistRuntimeService : Service() {
                         origin = io.github.vafu.mist.core.MediaOrigin.LOCAL,
                         status = player.status,
                         metadata = player.metadata,
+                        artworkPath = player.metadata.artwork?.path,
                         capabilities = player.capabilities,
                         positionMs = player.positionMs,
                     )
@@ -567,6 +718,9 @@ public class MistRuntimeService : Service() {
     private fun requireClipboard(): Clipboard =
         clipboard ?: error("Mist runtime is not ready")
 
+    private fun requireFiles(): FileTransfer =
+        files ?: error("Mist runtime is not ready")
+
     private fun requireMedia(): Media = media ?: error("Mist runtime is not ready")
 
     private fun createNotificationChannels() {
@@ -608,10 +762,12 @@ public class MistRuntimeService : Service() {
         androidMedia?.stop()
         media?.close()
         clipboard?.close()
+        files?.close()
         notifications?.close()
         pairing?.close()
         devices?.close()
         app?.close()
+        files = null
         notifications = null
         pairing = null
         devices = null

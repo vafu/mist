@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::{Clipboard, DeviceManager, Media, NotificationChannel, Pairing};
+use crate::{Clipboard, DeviceManager, FileTransfer, Media, NotificationChannel, Pairing};
 
 /// Root application contract for one running Mist instance.
 ///
@@ -29,6 +29,9 @@ pub trait MistApp: Send + Sync + Debug {
 
     /// Returns the media player service.
     fn media(&self) -> Arc<dyn Media>;
+
+    /// Returns the file transfer service.
+    fn files(&self) -> Arc<dyn FileTransfer>;
 
     /// Closes active sessions and the local endpoint.
     async fn shutdown(&self);
