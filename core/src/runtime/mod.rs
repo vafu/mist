@@ -29,8 +29,8 @@ use crate::media::{IrohMedia, MediaProvider, MediaRegistry};
 use crate::notification::IrohNotificationChannel;
 use crate::pairing::IrohPairing;
 use crate::protocol::wire::{
-    ControlFrame, NotificationActionActivated as WireActionActivated, PairingAuthenticate,
-    control_frame,
+    ControlFrame, NotificationActionActivated as WireActionActivated,
+    NotificationConsumed as WireNotificationConsumed, PairingAuthenticate, control_frame,
 };
 use crate::protocol::{
     ClipboardMetadata, address_snapshot, decode_address_snapshot, decode_clipboard_item,
@@ -41,10 +41,11 @@ use crate::protocol::{
 use crate::storage::{AddressSource, StateStore, StoreError};
 use crate::transfer::{BlobStore, StoredBlob};
 use crate::{
-    Clipboard, ClipboardContent, ClipboardError, DeviceError, DeviceInfo, DeviceManager, FileOffer,
-    FileShare, FileTransfer, MIST_ALPN, ManagedDevice, MediaCommand, MediaError, MediaEvent,
-    MediaPlayer, MistApp, Notification, NotificationChannel, NotificationError, NotificationKind,
-    Pairing, ReceivedClipboard, ReceivedNotification, TransferError,
+    Clipboard, ClipboardContent, ClipboardError, ConsumedNotification, DeviceError, DeviceInfo,
+    DeviceManager, FileOffer, FileShare, FileTransfer, MIST_ALPN, ManagedDevice, MediaCommand,
+    MediaError, MediaEvent, MediaPlayer, MistApp, Notification, NotificationChannel,
+    NotificationError, NotificationKind, Pairing, ReceivedClipboard, ReceivedNotification,
+    TransferError,
 };
 
 pub(crate) use builder::MistBuilder;
@@ -108,7 +109,10 @@ pub(crate) struct Session {
     notifications: broadcast::Sender<ReceivedNotification>,
     clipboard: broadcast::Sender<ReceivedClipboard>,
     activations: broadcast::Sender<crate::ActivatedNotificationAction>,
+    consumed: broadcast::Sender<ConsumedNotification>,
     sent_notifications: StdMutex<std::collections::HashMap<String, Vec<String>>>,
+    notification_recipients: StdMutex<std::collections::HashMap<String, Vec<EndpointId>>>,
+    received_notifications: StdMutex<std::collections::HashSet<(EndpointId, String)>>,
     blob_directory: std::path::PathBuf,
     files: Arc<dyn BlobStore>,
     file_shares: StdMutex<std::collections::HashMap<String, StoredBlob>>,
@@ -138,6 +142,7 @@ impl Session {
         let (notifications, _) = broadcast::channel(256);
         let (clipboard, _) = broadcast::channel(64);
         let (activations, _) = broadcast::channel(64);
+        let (consumed, _) = broadcast::channel(64);
         let (file_offers, _) = broadcast::channel(64);
         let (received_files, _) = broadcast::channel(64);
         let (pairing_attempts_tx, pairing_attempts_rx) = mpsc::channel(32);
@@ -152,7 +157,10 @@ impl Session {
             notifications,
             clipboard,
             activations,
+            consumed,
             sent_notifications: StdMutex::new(std::collections::HashMap::new()),
+            notification_recipients: StdMutex::new(std::collections::HashMap::new()),
+            received_notifications: StdMutex::new(std::collections::HashSet::new()),
             blob_directory,
             files,
             file_shares: StdMutex::new(std::collections::HashMap::new()),
@@ -214,12 +222,13 @@ impl Session {
         self.activations.subscribe()
     }
 
+    pub(crate) fn subscribe_consumed(&self) -> broadcast::Receiver<ConsumedNotification> {
+        self.consumed.subscribe()
+    }
+
     /// Remembers the actions of a notification this device sent, so an
     /// activation from a peer can be validated and routed to the local app.
     fn remember_sent_notification(&self, notification: &Notification) {
-        if notification.actions.is_empty() {
-            return;
-        }
         let mut sent = self
             .sent_notifications
             .lock()
@@ -258,6 +267,90 @@ impl Session {
         });
     }
 
+    /// Handles a notification consumed on either side of the bridge.
+    ///
+    /// A peer reports that it consumed a notification this device sent, or
+    /// retracts one it sent earlier. Either way the notification is finished,
+    /// so it is surfaced once and dropped from local tracking.
+    fn receive_notification_consumed(
+        &self,
+        endpoint_id: EndpointId,
+        wire: WireNotificationConsumed,
+    ) {
+        // Only a peer that actually received this notification may finish it.
+        let owned_by_peer = self
+            .notification_recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&wire.notification_id)
+            .is_some_and(|recipients| recipients.contains(&endpoint_id));
+        let owned = owned_by_peer
+            && self
+                .sent_notifications
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&wire.notification_id)
+                .is_some();
+        let received = self
+            .received_notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(endpoint_id, wire.notification_id.clone()));
+        if !owned && !received {
+            return;
+        }
+        if owned {
+            self.notification_recipients
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&wire.notification_id);
+        }
+        let _ = self.consumed.send(ConsumedNotification {
+            source_endpoint_id: endpoint_id.to_string(),
+            notification_id: wire.notification_id,
+        });
+    }
+
+    /// Retracts a notification this device sent from every peer that has it.
+    ///
+    /// Used when the local copy is dismissed. Pending copies are dropped from
+    /// the outbox, and delivered ones are removed on the peers.
+    pub(crate) async fn retract_notification(
+        self: &Arc<Self>,
+        notification_id: String,
+    ) -> Result<(), NotificationError> {
+        let recipients = self
+            .notification_recipients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&notification_id)
+            .unwrap_or_default();
+        self.sent_notifications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&notification_id);
+        for endpoint_id in recipients {
+            self.outbox
+                .cancel_notification(endpoint_id, &notification_id);
+            let Some(connection) = self.devices.connection(endpoint_id) else {
+                continue;
+            };
+            let Ok(mut stream) = connection.open_uni().await else {
+                continue;
+            };
+            let frame = ControlFrame {
+                body: Some(control_frame::Body::NotificationConsumed(
+                    WireNotificationConsumed {
+                        notification_id: notification_id.clone(),
+                    },
+                )),
+            };
+            let _ = write_control_frame(&mut stream, &frame).await;
+            let _ = stream.finish();
+        }
+        Ok(())
+    }
+
     /// Sends an activated action back to the device that owns the notification.
     pub(crate) async fn activate_notification(
         self: &Arc<Self>,
@@ -290,6 +383,52 @@ impl Session {
                         notification_id,
                         action_id,
                     },
+                )),
+            },
+        )
+        .await
+        .map_err(|error| NotificationError::Transport {
+            reason: error.to_string(),
+        })?;
+        stream
+            .finish()
+            .map_err(|error| NotificationError::Transport {
+                reason: error.to_string(),
+            })
+    }
+
+    /// Reports that a notification sent by `endpoint_id` is no longer needed.
+    ///
+    /// Undelivered copies are dropped from the outbox; delivered ones are
+    /// forwarded so the owner can clear its own copy.
+    pub(crate) async fn consume_notification(
+        self: &Arc<Self>,
+        endpoint_id: EndpointId,
+        notification_id: String,
+    ) -> Result<(), NotificationError> {
+        if !self.devices.contains(endpoint_id) {
+            return Err(NotificationError::UnknownDevice {
+                endpoint_id: endpoint_id.to_string(),
+            });
+        }
+        self.outbox
+            .cancel_notification(endpoint_id, &notification_id);
+        let Some(connection) = self.devices.connection(endpoint_id) else {
+            // Nothing was delivered, and the pending copy is already dropped.
+            return Ok(());
+        };
+        let mut stream =
+            connection
+                .open_uni()
+                .await
+                .map_err(|error| NotificationError::Transport {
+                    reason: error.to_string(),
+                })?;
+        write_control_frame(
+            &mut stream,
+            &ControlFrame {
+                body: Some(control_frame::Body::NotificationConsumed(
+                    WireNotificationConsumed { notification_id },
                 )),
             },
         )
@@ -841,6 +980,16 @@ impl Session {
                 let Some(source_device) = self.devices.device_info(endpoint_id) else {
                     return;
                 };
+                {
+                    let mut received = self
+                        .received_notifications
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if received.len() >= MAX_TRACKED_NOTIFICATIONS * 4 {
+                        received.clear();
+                    }
+                    received.insert((endpoint_id, notification.id.clone()));
+                }
                 let _ = self.notifications.send(ReceivedNotification {
                     source_endpoint_id: endpoint_id.to_string(),
                     source_device,
@@ -894,6 +1043,9 @@ impl Session {
             }
             Some(control_frame::Body::NotificationActionActivated(wire)) => {
                 self.receive_notification_activation(endpoint_id, wire);
+            }
+            Some(control_frame::Body::NotificationConsumed(wire)) => {
+                self.receive_notification_consumed(endpoint_id, wire);
             }
             Some(control_frame::Body::FileOffer(wire)) => {
                 let Ok(offer) = crate::protocol::decode_file_offer(wire) else {
@@ -1296,6 +1448,16 @@ impl Session {
                     reason: format!("{label}: {error}"),
                 })?;
             images.push(Some(attachment));
+        }
+        {
+            let mut recipients = self
+                .notification_recipients
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if recipients.len() >= MAX_TRACKED_NOTIFICATIONS {
+                recipients.clear();
+            }
+            recipients.insert(notification.id.clone(), targets.clone());
         }
         for endpoint_id in targets {
             for image in images.iter().flatten() {

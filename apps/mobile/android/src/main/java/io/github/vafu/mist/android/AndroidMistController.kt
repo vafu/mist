@@ -40,6 +40,7 @@ public class AndroidMistController(context: Context) : MistController {
 
     private val clipboardReceivers = java.util.concurrent.CopyOnWriteArrayList<(Bundle) -> Unit>()
     private val actionReceivers = java.util.concurrent.CopyOnWriteArrayList<(Bundle) -> Unit>()
+    private val consumedReceivers = java.util.concurrent.CopyOnWriteArrayList<(Bundle) -> Unit>()
 
     private val callback: IMistCallback = object : IMistCallback.Stub() {
         override fun onStateChanged(state: Bundle) {
@@ -52,6 +53,10 @@ public class AndroidMistController(context: Context) : MistController {
 
         override fun onNotificationAction(activation: Bundle) {
             actionReceivers.forEach { receiver -> runCatching { receiver(activation) } }
+        }
+
+        override fun onNotificationConsumed(consumption: Bundle) {
+            consumedReceivers.forEach { receiver -> runCatching { receiver(consumption) } }
         }
     }
 
@@ -182,6 +187,19 @@ public class AndroidMistController(context: Context) : MistController {
         }
         actionReceivers.add(receiver)
         return AutoCloseable { actionReceivers.remove(receiver) }
+    }
+
+    /** Registers a listener for this device's notifications consumed by peers. */
+    public fun subscribeConsumedNotifications(onConsumed: (String, String) -> Unit): AutoCloseable {
+        val receiver: (Bundle) -> Unit = { bundle ->
+            val endpoint = bundle.getString(KEY_ACTIVATION_ENDPOINT).orEmpty()
+            val notification = bundle.getString(KEY_ACTIVATION_NOTIFICATION).orEmpty()
+            if (endpoint.isNotEmpty() && notification.isNotEmpty()) {
+                onConsumed(endpoint, notification)
+            }
+        }
+        consumedReceivers.add(receiver)
+        return AutoCloseable { consumedReceivers.remove(receiver) }
     }
 
     override fun close() {

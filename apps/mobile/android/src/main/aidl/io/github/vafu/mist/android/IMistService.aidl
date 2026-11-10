@@ -19,5 +19,9 @@ interface IMistService {
     void shareFile(String path, in String[] targets, IMistResultCallback callback);
     void activateNotification(String sourceEndpointId, String notificationId, String actionId,
         IMistResultCallback callback);
+    void consumeNotification(String sourceEndpointId, String notificationId,
+        IMistResultCallback callback);
+    void retractNotification(String notificationId, IMistResultCallback callback);
     oneway void pushNotification(in Bundle notification);
+    oneway void discardNotification(String notificationId);
 }

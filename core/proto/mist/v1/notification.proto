@@ -30,6 +30,12 @@ message NotificationActionActivated {
   string action_id = 2;
 }
 
+// The user is done with a notification this device sent: they dismissed it,
+// or activating an action consumed it. The owner should clear its own copy.
+message NotificationConsumed {
+  string notification_id = 1;
+}
+
 // Metadata for one notification image; bytes follow the control frame.
 message NotificationImage {
   string mime_type = 1;

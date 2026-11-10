@@ -118,6 +118,30 @@ impl Outbox {
         message
     }
 
+    /// Drops queued notifications for one endpoint that match `notification_id`.
+    ///
+    /// Returns how many pending messages were removed.
+    pub(crate) fn cancel_notification(
+        &self,
+        endpoint_id: EndpointId,
+        notification_id: &str,
+    ) -> usize {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(queue) = pending.get_mut(&endpoint_id) else {
+            return 0;
+        };
+        let before = queue.len();
+        queue.retain(|message| match message {
+            Outbound::Notification { notification, .. } => notification.id != notification_id,
+            Outbound::Clipboard { .. } | Outbound::FileOffer(_) => true,
+        });
+        let removed = before - queue.len();
+        if queue.is_empty() {
+            pending.remove(&endpoint_id);
+        }
+        removed
+    }
+
     pub(crate) fn has_pending(&self, endpoint_id: EndpointId) -> bool {
         self.pending
             .lock()

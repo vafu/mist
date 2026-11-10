@@ -17,6 +17,7 @@ use mist_linux::media::{MprisMedia, MprisPublisher};
 use mist_linux::{BUS_NAME, DeviceRow, MediaRow, OBJECT_PATH, local_device_info};
 use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
+use zbus::message::Type;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedValue;
 use zbus::{Connection, MessageStream};
@@ -294,12 +295,24 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Arc::clone(&runtime),
     ));
     let action_origins: ActionOrigins = Arc::new(Mutex::new(HashMap::new()));
+    let pending_notify: PendingNotify = Arc::new(Mutex::new(HashMap::new()));
     let mut incoming_notifications = tokio::spawn(forward_incoming_notifications(
         connection.clone(),
         Arc::clone(&runtime),
         Arc::clone(&action_origins),
     ));
     let mut monitored_notifications = tokio::spawn(monitor_desktop_notifications(
+        connection.clone(),
+        Arc::clone(&runtime),
+        Arc::clone(&action_origins),
+        Arc::clone(&pending_notify),
+    ));
+    let mut activated_notifications = tokio::spawn(forward_activated_notifications(
+        connection.clone(),
+        Arc::clone(&runtime),
+        Arc::clone(&action_origins),
+    ));
+    let mut consumed_notifications = tokio::spawn(forward_consumed_notifications(
         connection.clone(),
         Arc::clone(&runtime),
         Arc::clone(&action_origins),
@@ -328,6 +341,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         result = &mut device_events => result??,
         result = &mut incoming_notifications => result??,
         result = &mut monitored_notifications => result??,
+        result = &mut activated_notifications => result??,
+        result = &mut consumed_notifications => result??,
         result = &mut incoming_clipboard => result??,
         result = &mut local_clipboard_changes => result??,
         result = &mut published_media => result??,
@@ -337,6 +352,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     device_events.abort();
     incoming_notifications.abort();
     monitored_notifications.abort();
+    activated_notifications.abort();
+    consumed_notifications.abort();
     incoming_clipboard.abort();
     local_clipboard_changes.abort();
     published_media.abort();
@@ -383,6 +400,10 @@ async fn forward_device_events(
 /// produced it, so `ActionInvoked` can be routed home.
 type ActionOrigins = Arc<Mutex<HashMap<u32, (String, String, Vec<String>)>>>;
 
+/// Correlates our own outbound `Notify` calls with the notification id the
+/// desktop server assigned, so actions arriving from peers can be routed back.
+type PendingNotify = Arc<Mutex<HashMap<u32, (String, String, Vec<String>)>>>;
+
 /// How many desktop notifications keep their action mapping.
 const MAX_TRACKED_DESKTOP_NOTIFICATIONS: usize = 256;
 
@@ -400,7 +421,9 @@ async fn forward_incoming_notifications(
             &received.notification,
         )
         .await?;
-        if !received.notification.actions.is_empty() {
+        // Every incoming notification is tracked so that dismissing it locally
+        // can be reported back, not only the ones with action buttons.
+        {
             let mut origins = origins.lock().await;
             if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
                 origins.clear();
@@ -431,6 +454,92 @@ async fn forward_incoming_notifications(
                 &received.notification.body,
             )
             .await?;
+    }
+}
+
+/// Surfaces actions activated on a remote copy of a locally shown notification.
+///
+/// The desktop notification server emitted the original `ActionInvoked` for
+/// *its* copy, not ours. D-Bus signals are broadcast and clients subscribe with
+/// match rules rather than by sender, so re-emitting `ActionInvoked` with the
+/// original desktop id and action key delivers the tap to the owning app. The
+/// local copy is then closed, since the action consumed the notification.
+async fn forward_activated_notifications(
+    connection: Connection,
+    runtime: Arc<dyn MistApp>,
+    origins: ActionOrigins,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let activations = runtime.notification_channel().subscribe_activations();
+    loop {
+        let activation = activations.next().await?;
+        let desktop_id = {
+            let origins = origins.lock().await;
+            origins.iter().find_map(|(desktop_id, origin)| {
+                (origin.1 == activation.notification_id).then_some(*desktop_id)
+            })
+        };
+        let Some(desktop_id) = desktop_id else {
+            continue;
+        };
+        origins.lock().await.remove(&desktop_id);
+        if let Err(error) = connection
+            .emit_signal(
+                None::<&str>,
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "ActionInvoked",
+                &(desktop_id, activation.action_id.as_str()),
+            )
+            .await
+        {
+            eprintln!("mistd: could not re-emit ActionInvoked: {error}");
+        }
+        if let Err(error) = connection
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "CloseNotification",
+                &(desktop_id,),
+            )
+            .await
+        {
+            eprintln!("mistd: could not close activated notification: {error}");
+        }
+    }
+}
+
+/// Closes local desktop notifications that a peer consumed.
+async fn forward_consumed_notifications(
+    connection: Connection,
+    runtime: Arc<dyn MistApp>,
+    origins: ActionOrigins,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let consumed = runtime.notification_channel().subscribe_consumed();
+    loop {
+        let consumed = consumed.next().await?;
+        let desktop_id = {
+            let origins = origins.lock().await;
+            origins.iter().find_map(|(desktop_id, origin)| {
+                (origin.1 == consumed.notification_id).then_some(*desktop_id)
+            })
+        };
+        let Some(desktop_id) = desktop_id else {
+            continue;
+        };
+        origins.lock().await.remove(&desktop_id);
+        if let Err(error) = connection
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "CloseNotification",
+                &(desktop_id,),
+            )
+            .await
+        {
+            eprintln!("mistd: could not close consumed notification: {error}");
+        }
     }
 }
 
@@ -580,6 +689,9 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// Routes a desktop `ActionInvoked` signal back to the owning device.
+///
+/// Activating an action consumes the notification, so the owning device is
+/// told to clear its copy as well.
 async fn handle_action_invoked(
     runtime: &Arc<dyn MistApp>,
     action_origins: &ActionOrigins,
@@ -588,20 +700,62 @@ async fn handle_action_invoked(
     let Ok((desktop_id, key)) = message.body().deserialize::<(u32, String)>() else {
         return;
     };
+    // `default` is the synthetic action sent when the user clicks the body of
+    // a notification that has no buttons, or the body of one that does. It has
+    // no counterpart on the owning device, so it only consumes the notification.
+    let is_body_click = key == "default";
     let Some((endpoint_id, notification_id, actions)) =
         action_origins.lock().await.get(&desktop_id).cloned()
     else {
         return;
     };
-    if !actions.contains(&key) {
+    if !is_body_click && !actions.contains(&key) {
         return;
+    }
+    action_origins.lock().await.remove(&desktop_id);
+    if !is_body_click
+        && let Err(error) = runtime
+            .notification_channel()
+            .activate(endpoint_id.clone(), notification_id.clone(), key)
+            .await
+    {
+        eprintln!("mistd: could not deliver notification action: {error}");
     }
     if let Err(error) = runtime
         .notification_channel()
-        .activate(endpoint_id, notification_id, key)
+        .consume(endpoint_id, notification_id)
         .await
     {
-        eprintln!("mistd: could not deliver notification action: {error}");
+        eprintln!("mistd: could not report consumed notification: {error}");
+    }
+}
+
+/// Routes a desktop `NotificationClosed` signal back to the owning device.
+async fn handle_notification_closed(
+    runtime: &Arc<dyn MistApp>,
+    action_origins: &ActionOrigins,
+    message: &zbus::Message,
+) {
+    let Ok((desktop_id, reason)) = message.body().deserialize::<(u32, u32)>() else {
+        return;
+    };
+    // 1 = expired, 2 = dismissed by the user, 3 = closed by a CloseNotification
+    // call. Only an explicit dismissal means the user is done with it; the
+    // programmatic close we issue ourselves must not bounce back.
+    if reason != 2 {
+        return;
+    }
+    let Some((endpoint_id, notification_id, _actions)) =
+        action_origins.lock().await.remove(&desktop_id)
+    else {
+        return;
+    };
+    if let Err(error) = runtime
+        .notification_channel()
+        .consume(endpoint_id, notification_id)
+        .await
+    {
+        eprintln!("mistd: could not report consumed notification: {error}");
     }
 }
 
@@ -664,11 +818,17 @@ async fn monitor_desktop_notifications(
     daemon_connection: Connection,
     runtime: Arc<dyn MistApp>,
     action_origins: ActionOrigins,
+    pending_notify: PendingNotify,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let monitor = Connection::session().await?;
     let rules = [
         "type='method_call',path='/org/freedesktop/Notifications',interface='org.freedesktop.Notifications',member='Notify'",
         "type='signal',interface='org.freedesktop.Notifications',member='ActionInvoked'",
+        "type='signal',interface='org.freedesktop.Notifications',member='NotificationClosed'",
+        // Notify replies carry the desktop notification id. Monitors only see
+        // messages matching a rule, and a method return matches none of the
+        // above, so it needs its own.
+        "type='method_return',sender='org.freedesktop.Notifications'",
     ];
     monitor
         .call_method(
@@ -684,9 +844,45 @@ async fn monitor_desktop_notifications(
         .unique_name()
         .map(ToString::to_string)
         .unwrap_or_default();
+    // Serial numbers are per connection, so replies are only accepted from the
+    // notification server itself.
+    // Resolved on the daemon connection: a monitor connection is passive and
+    // cannot issue method calls.
+    let server_name = daemon_connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetNameOwner",
+            &("org.freedesktop.Notifications",),
+        )
+        .await
+        .ok()
+        .and_then(|reply| reply.body().deserialize::<String>().ok());
     let mut messages = MessageStream::from(monitor);
     while let Some(message) = messages.next().await {
         let message = message?;
+        if message.header().message_type() == Type::MethodReturn {
+            let from_server = server_name.as_deref().is_some_and(|server| {
+                message
+                    .header()
+                    .sender()
+                    .is_some_and(|sender| sender.as_str() == server)
+            });
+            // A reply to our own `Notify` call carries the desktop id.
+            if let (true, Some(reply_to)) = (from_server, message.header().reply_serial()) {
+                let assigned = message.body().deserialize::<u32>().ok();
+                let origin = pending_notify.lock().await.remove(&reply_to.get());
+                if let (Some(desktop_id), Some(origin)) = (assigned, origin) {
+                    let mut origins = action_origins.lock().await;
+                    if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
+                        origins.clear();
+                    }
+                    origins.insert(desktop_id, origin);
+                }
+            }
+            continue;
+        }
         if message
             .header()
             .sender()
@@ -702,38 +898,71 @@ async fn monitor_desktop_notifications(
             handle_action_invoked(&runtime, &action_origins, &message).await;
             continue;
         }
-        let Ok((application, _, app_icon, title, body, raw_actions, hints, _)) =
-            message.body().deserialize::<NotifyBody>()
-        else {
-            continue;
-        };
-        let icon = hint_image(&hints, "image-path")
-            .or_else(|| hint_image(&hints, "image_path"))
-            .or_else(|| hint_image(&hints, "app_icon"))
-            .or_else(|| file_icon(&app_icon))
-            .or_else(|| desktop_entry_icon(&hints));
-        let image = hint_image(&hints, "image-data").or_else(|| hint_image(&hints, "image_data"));
-        let notification = Notification {
-            id: format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)),
-            application,
-            title,
-            body,
-            timestamp_ms: unix_millis(),
-            silent: false,
-            kind: NotificationKind::Message,
-            app_icon: icon,
-            image,
-            actions: parse_notify_actions(&raw_actions),
-        };
-        if let Err(error) = runtime
-            .notification_channel()
-            .push(notification, Vec::new())
-            .await
+        if message
+            .header()
+            .member()
+            .is_some_and(|member| member.as_str() == "NotificationClosed")
         {
-            eprintln!("mistd: could not forward desktop notification: {error}");
+            handle_notification_closed(&runtime, &action_origins, &message).await;
+            continue;
         }
+        forward_desktop_notification(&message, &runtime, &pending_notify).await;
     }
     Ok(())
+}
+
+/// Forwards one local desktop `Notify` call to the paired devices.
+///
+/// The outbound call is recorded so the server's reply, which carries the
+/// desktop notification id, can be matched back to the notification. Without
+/// that mapping, actions arriving from peers cannot be routed home.
+async fn forward_desktop_notification(
+    message: &zbus::Message,
+    runtime: &Arc<dyn MistApp>,
+    pending_notify: &PendingNotify,
+) {
+    let Ok((application, _, app_icon, title, body, raw_actions, hints, _)) =
+        message.body().deserialize::<NotifyBody>()
+    else {
+        return;
+    };
+    let icon = hint_image(&hints, "image-path")
+        .or_else(|| hint_image(&hints, "image_path"))
+        .or_else(|| hint_image(&hints, "app_icon"))
+        .or_else(|| file_icon(&app_icon))
+        .or_else(|| desktop_entry_icon(&hints));
+    let image = hint_image(&hints, "image-data").or_else(|| hint_image(&hints, "image_data"));
+    let notification = Notification {
+        id: format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)),
+        application,
+        title,
+        body,
+        timestamp_ms: unix_millis(),
+        silent: false,
+        kind: NotificationKind::Message,
+        app_icon: icon,
+        image,
+        actions: parse_notify_actions(&raw_actions),
+    };
+    let actions: Vec<String> = notification
+        .actions
+        .iter()
+        .map(|action| action.id.clone())
+        .collect();
+    let notification_id = notification.id.clone();
+    let serial = message.header().primary().serial_num();
+    pending_notify.lock().await.insert(
+        serial.get(),
+        (runtime.endpoint_id(), notification_id, actions),
+    );
+    if let Err(error) = runtime
+        .notification_channel()
+        .push(notification, Vec::new())
+        .await
+    {
+        pending_notify.lock().await.remove(&serial.get());
+        eprintln!("mistd: could not forward desktop notification: {error}");
+    }
 }
 
 /// Watches the native clipboard and schedules a send for each local change.

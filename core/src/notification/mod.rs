@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mist_app_contract::{
-    ActivatedNotificationAction, NotificationActivationStream, NotificationError,
-    NotificationEventStream, ReceivedNotification,
+    ActivatedNotificationAction, ConsumedNotification, NotificationActivationStream,
+    NotificationConsumedStream, NotificationError, NotificationEventStream, ReceivedNotification,
 };
 use tokio::sync::{Mutex, broadcast};
 
@@ -57,6 +57,34 @@ impl RuntimeNotificationActivationStream {
 #[async_trait]
 impl NotificationActivationStream for RuntimeNotificationActivationStream {
     async fn next(&self) -> Result<ActivatedNotificationAction, NotificationError> {
+        self.receiver
+            .lock()
+            .await
+            .recv()
+            .await
+            .map_err(|error| match error {
+                broadcast::error::RecvError::Closed => NotificationError::Closed,
+                broadcast::error::RecvError::Lagged(count) => NotificationError::Lagged { count },
+            })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeNotificationConsumedStream {
+    receiver: Arc<Mutex<broadcast::Receiver<ConsumedNotification>>>,
+}
+
+impl RuntimeNotificationConsumedStream {
+    pub(crate) fn new(receiver: broadcast::Receiver<ConsumedNotification>) -> Arc<Self> {
+        Arc::new(Self {
+            receiver: Arc::new(Mutex::new(receiver)),
+        })
+    }
+}
+
+#[async_trait]
+impl NotificationConsumedStream for RuntimeNotificationConsumedStream {
+    async fn next(&self) -> Result<ConsumedNotification, NotificationError> {
         self.receiver
             .lock()
             .await

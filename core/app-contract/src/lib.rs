@@ -26,9 +26,10 @@ pub use media::{
     PlaybackStatus,
 };
 pub use notification::{
-    ActivatedNotificationAction, Notification, NotificationAction, NotificationActivationStream,
-    NotificationChannel, NotificationError, NotificationEventStream, NotificationImage,
-    NotificationKind, ReceivedNotification,
+    ActivatedNotificationAction, ConsumedNotification, Notification, NotificationAction,
+    NotificationActivationStream, NotificationChannel, NotificationConsumedStream,
+    NotificationError, NotificationEventStream, NotificationImage, NotificationKind,
+    ReceivedNotification,
 };
 pub use pairing::{PairedPeer, Pairing, PairingError, PairingOffer};
 pub use transfer::{

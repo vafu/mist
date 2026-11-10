@@ -24,5 +24,6 @@ message ControlFrame {
     MediaCommandRequest media_command = 10;
     NotificationActionActivated notification_action_activated = 11;
     FileOffer file_offer = 12;
+    NotificationConsumed notification_consumed = 13;
   }
 }

@@ -565,6 +565,57 @@ async fn notification_actions_round_trip_to_the_owner() {
 }
 
 #[tokio::test]
+async fn consumed_notifications_round_trip_to_the_owner() {
+    let (_left_dir, _right_dir, left, right) = paired().await;
+    let incoming = right.notification_channel().subscribe();
+    let consumed = left.notification_channel().subscribe_consumed();
+
+    left.notification_channel()
+        .push(
+            Notification {
+                id: "dismissable".to_owned(),
+                application: "Mist tests".to_owned(),
+                title: "Dismiss me".to_owned(),
+                body: String::new(),
+                timestamp_ms: 8,
+                silent: true,
+                kind: NotificationKind::Message,
+                app_icon: None,
+                image: None,
+                actions: Vec::new(),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+    let received = tokio::time::timeout(Duration::from_secs(5), incoming.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received.notification.id, "dismissable");
+
+    right
+        .notification_channel()
+        .consume(
+            received.source_endpoint_id.clone(),
+            "dismissable".to_owned(),
+        )
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), consumed.next())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.notification_id, "dismissable");
+    assert_eq!(event.source_endpoint_id, right.endpoint_id());
+
+    left.shutdown().await;
+    right.shutdown().await;
+}
+
+#[tokio::test]
 async fn unknown_notification_actions_are_ignored() {
     let (_left_dir, _right_dir, left, right) = paired().await;
     let activations = left.notification_channel().subscribe_activations();

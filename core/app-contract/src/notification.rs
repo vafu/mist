@@ -77,6 +77,18 @@ pub struct ActivatedNotificationAction {
     pub action_id: String,
 }
 
+/// A notification this device sent which the receiving peer is now done with.
+///
+/// The peer either dismissed the notification or activated an action that
+/// consumed it. The owning device clears its local copy.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct ConsumedNotification {
+    /// Endpoint that consumed the notification.
+    pub source_endpoint_id: String,
+    /// Identifier of the consumed notification.
+    pub notification_id: String,
+}
+
 /// Failure while sending or receiving notifications.
 #[derive(Debug, Error, uniffi::Error)]
 pub enum NotificationError {
@@ -139,8 +151,37 @@ pub trait NotificationChannel: Send + Sync + Debug {
         action_id: String,
     ) -> Result<(), NotificationError>;
 
+    /// Reports that a notification this device received is now consumed.
+    ///
+    /// Called when the user dismisses a remote notification, or when an
+    /// activated action consumed it. `source_endpoint_id` identifies the device
+    /// that sent the notification. When the notification has not been delivered
+    /// yet, the pending copy is dropped instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the device is unknown or unreachable.
+    async fn consume(
+        &self,
+        source_endpoint_id: String,
+        notification_id: String,
+    ) -> Result<(), NotificationError>;
+
+    /// Retracts a notification this device sent from every peer that has it.
+    ///
+    /// Called when the local copy is dismissed. Pending copies are dropped
+    /// before delivery; delivered ones are removed on the peers.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures are reported but do not prevent retraction.
+    async fn retract(&self, notification_id: String) -> Result<(), NotificationError>;
+
     /// Creates a stream of actions activated on notifications this device sent.
     fn subscribe_activations(&self) -> Arc<dyn NotificationActivationStream>;
+
+    /// Creates a stream of notifications this device sent that peers consumed.
+    fn subscribe_consumed(&self) -> Arc<dyn NotificationConsumedStream>;
 }
 
 /// Event-driven stream of actions activated on notifications this device sent.
@@ -149,4 +190,12 @@ pub trait NotificationChannel: Send + Sync + Debug {
 pub trait NotificationActivationStream: Send + Sync + Debug {
     /// Suspends until the next activated action is available.
     async fn next(&self) -> Result<ActivatedNotificationAction, NotificationError>;
+}
+
+/// Event-driven stream of notifications this device sent that peers consumed.
+#[uniffi::export]
+#[async_trait]
+pub trait NotificationConsumedStream: Send + Sync + Debug {
+    /// Suspends until the next consumed notification is available.
+    async fn next(&self) -> Result<ConsumedNotification, NotificationError>;
 }

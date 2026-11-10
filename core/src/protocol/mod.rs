@@ -444,6 +444,7 @@ pub(crate) fn message_name(body: &wire::control_frame::Body) -> &'static str {
         wire::control_frame::Body::MediaSnapshot(_) => "media snapshot",
         wire::control_frame::Body::MediaCommand(_) => "media command",
         wire::control_frame::Body::NotificationActionActivated(_) => "notification action",
+        wire::control_frame::Body::NotificationConsumed(_) => "notification consumption",
         wire::control_frame::Body::FileOffer(_) => "file offer",
     }
 }

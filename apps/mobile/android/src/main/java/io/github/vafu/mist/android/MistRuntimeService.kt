@@ -187,6 +187,34 @@ public class MistRuntimeService : Service() {
             }
         }
 
+        override fun consumeNotification(
+            sourceEndpointId: String,
+            notificationId: String,
+            callback: IMistResultCallback,
+        ) {
+            runOperation(callback) {
+                requireNotifications().consume(sourceEndpointId, notificationId)
+                Bundle.EMPTY
+            }
+        }
+
+        override fun retractNotification(
+            notificationId: String,
+            callback: IMistResultCallback,
+        ) {
+            runOperation(callback) {
+                requireNotifications().retract(notificationId)
+                Bundle.EMPTY
+            }
+        }
+
+        override fun discardNotification(notificationId: String) {
+            getSystemService(NotificationManager::class.java).cancel(
+                notificationTagFor(notificationId),
+                REMOTE_NOTIFICATION_ID,
+            )
+        }
+
         override fun pushNotification(notification: Bundle) {
             scope.launch {
                 runCatching {
@@ -221,15 +249,34 @@ public class MistRuntimeService : Service() {
             val command = intent.getStringExtra(MistServiceStarter.EXTRA_MEDIA_COMMAND)
             dispatchMediaCommand(command)
         }
+        if (intent?.action == ACTION_NOTIFICATION_DISCARD) {
+            val endpoint = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ENDPOINT)
+            val notificationId = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ID)
+            if (endpoint != null && notificationId != null) {
+                scope.launch {
+                    runCatching {
+                        requireNotifications().consume(endpoint, notificationId)
+                    }.onFailure { Log.w(TAG, "could not report discarded notification", it) }
+                }
+            }
+        }
         if (intent?.action == MistServiceStarter.ACTION_NOTIFICATION_ACTION) {
             val endpoint = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ENDPOINT)
             val notificationId = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ID)
             val actionId = intent.getStringExtra(MistServiceStarter.EXTRA_NOTIFICATION_ACTION)
             if (endpoint != null && notificationId != null && actionId != null) {
                 scope.launch {
-                    runCatching {
-                        requireNotifications().activate(endpoint, notificationId, actionId)
-                    }.onFailure { Log.e(TAG, "could not activate notification action", it) }
+                    val channel = runCatching { requireNotifications() }.getOrElse {
+                        Log.e(TAG, "could not activate notification action", it)
+                        return@launch
+                    }
+                    runCatching { channel.activate(endpoint, notificationId, actionId) }
+                        .onFailure { Log.e(TAG, "could not activate notification action", it) }
+                    // Activating an action consumes the notification.
+                    runCatching { channel.consume(endpoint, notificationId) }
+                        .onFailure { Log.w(TAG, "could not report consumed action", it) }
+                    getSystemService(NotificationManager::class.java)
+                        .cancel(notificationTagFor(notificationId), REMOTE_NOTIFICATION_ID)
                 }
             }
         }
@@ -357,6 +404,7 @@ public class MistRuntimeService : Service() {
             }.also { it.start() }
             scope.launch { forwardMediaEvents() }
             scope.launch { forwardNotificationActions() }
+            scope.launch { forwardConsumedNotifications() }
         }.onFailure { error ->
             Log.e(TAG, "Mist runtime failed to start", error)
             runtimeReady.complete(null)
@@ -405,6 +453,13 @@ public class MistRuntimeService : Service() {
                         "${received.notification.application} · ${received.sourceDevice.displayName}",
                     )
                     .setAutoCancel(true)
+                    .setDeleteIntent(
+                        acknowledgedIntent(
+                            ACTION_NOTIFICATION_DISCARD,
+                            received.sourceEndpointId,
+                            received.notification.id,
+                        ),
+                    )
                 val icon = received.notification.appIcon?.loadBitmap()
                 val image = received.notification.image?.loadBitmap()
                 if (icon != null) {
@@ -432,8 +487,8 @@ public class MistRuntimeService : Service() {
                 val notification = builder.build()
                 runCatching {
                     getSystemService(NotificationManager::class.java).notify(
-                        "${received.sourceEndpointId}:${received.notification.id}",
-                        0,
+                        notificationTagFor(received.notification.id),
+                        REMOTE_NOTIFICATION_ID,
                         notification,
                     )
                 }.onFailure { Log.e(TAG, "Could not show remote notification", it) }
@@ -574,20 +629,53 @@ public class MistRuntimeService : Service() {
         sourceEndpointId: String,
         notificationId: String,
         actionId: String,
+    ): android.app.PendingIntent = acknowledgedIntent(
+        MistServiceStarter.ACTION_NOTIFICATION_ACTION,
+        sourceEndpointId,
+        notificationId,
+        actionId,
+    )
+
+    /**
+     * Builds a self-targeted service intent for a remote notification event.
+     *
+     * Intents are identified by action, data, type and class only, so extras
+     * alone would let every notification share a PendingIntent. The data URI
+     * carries the identity to keep them distinct, and the request code adds the
+     * action on top.
+     */
+    private fun acknowledgedIntent(
+        action: String,
+        sourceEndpointId: String,
+        notificationId: String,
+        actionId: String? = null,
     ): android.app.PendingIntent {
+        val identity = android.net.Uri.Builder()
+            .scheme(ACTION_URI_SCHEME)
+            .authority(sourceEndpointId)
+            .appendPath(notificationId)
+            .apply { if (actionId != null) appendPath(actionId) }
+            .build()
         val intent = Intent(this, MistRuntimeService::class.java).apply {
-            action = MistServiceStarter.ACTION_NOTIFICATION_ACTION
+            this.action = action
+            data = identity
             putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ENDPOINT, sourceEndpointId)
             putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ID, notificationId)
-            putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ACTION, actionId)
+            if (actionId != null) {
+                putExtra(MistServiceStarter.EXTRA_NOTIFICATION_ACTION, actionId)
+            }
         }
+        val requestCode = (sourceEndpointId + notificationId + (actionId ?: "")).hashCode()
         return android.app.PendingIntent.getService(
             this,
-            actionId.hashCode(),
+            requestCode,
             intent,
             android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
         )
     }
+
+    private fun notificationTagFor(notificationId: String): String =
+        "$REMOTE_NOTIFICATION_TAG_PREFIX$notificationId"
 
     /** Relays actions activated by peers back to the app that owns them. */
     private suspend fun forwardNotificationActions() {
@@ -705,6 +793,40 @@ public class MistRuntimeService : Service() {
             }
         } finally {
             callbacks.finishBroadcast()
+        }
+    }
+
+    /** Relays notifications consumed by peers back to the app that owns them. */
+    private suspend fun forwardConsumedNotifications() {
+        val notifications = notifications ?: return
+        val stream = notifications.subscribeConsumed()
+        try {
+            while (true) {
+                val consumed = try {
+                    stream.next()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Notification consumption stream stopped", error)
+                    return
+                }
+                getSystemService(NotificationManager::class.java)
+                    .cancel(notificationTagFor(consumed.notificationId), REMOTE_NOTIFICATION_ID)
+                val bundle = Bundle().apply {
+                    putString(KEY_ACTIVATION_ENDPOINT, consumed.sourceEndpointId)
+                    putString(KEY_ACTIVATION_NOTIFICATION, consumed.notificationId)
+                }
+                val count = callbacks.beginBroadcast()
+                try {
+                    repeat(count) { index ->
+                        runCatching {
+                            callbacks.getBroadcastItem(index).onNotificationConsumed(bundle)
+                        }
+                    }
+                } finally {
+                    callbacks.finishBroadcast()
+                }
+            }
+        } finally {
+            stream.close()
         }
     }
 
@@ -842,6 +964,11 @@ public class MistRuntimeService : Service() {
         const val SERVICE_CHANNEL_ID: String = "mist_service"
         const val REMOTE_CHANNEL_ID: String = "mist_remote_notifications"
         const val REMOTE_SILENT_CHANNEL_ID: String = "mist_remote_notifications_silent"
+        const val REMOTE_NOTIFICATION_ID: Int = 1
+        const val REMOTE_NOTIFICATION_TAG_PREFIX: String = "mist:"
+        const val ACTION_NOTIFICATION_DISCARD: String =
+            "io.github.vafu.mist.action.NOTIFICATION_DISCARD"
+        const val ACTION_URI_SCHEME: String = "mist-notification"
     }
 }
 
