@@ -407,6 +407,10 @@ type PendingNotify = Arc<Mutex<HashMap<u32, (String, String, Vec<String>)>>>;
 /// How many desktop notifications keep their action mapping.
 const MAX_TRACKED_DESKTOP_NOTIFICATIONS: usize = 256;
 
+/// Rsynapse notification server interface used to deliver actions home.
+const RSYNAPSE_NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
+const RSYNAPSE_NOTIFICATIONS_INTERFACE: &str = "org.rsynapse.Notifications1";
+
 async fn forward_incoming_notifications(
     connection: Connection,
     runtime: Arc<dyn MistApp>,
@@ -457,13 +461,12 @@ async fn forward_incoming_notifications(
     }
 }
 
-/// Surfaces actions activated on a remote copy of a locally shown notification.
+/// Delivers actions activated on a remote copy of a locally shown notification.
 ///
-/// The desktop notification server emitted the original `ActionInvoked` for
-/// *its* copy, not ours. D-Bus signals are broadcast and clients subscribe with
-/// match rules rather than by sender, so re-emitting `ActionInvoked` with the
-/// original desktop id and action key delivers the tap to the owning app. The
-/// local copy is then closed, since the action consumed the notification.
+/// `ActionInvoked` is only accepted from the notification server's own
+/// connection, so the server has to run the action on our behalf. The
+/// rsynapse-only `InvokeAction` method does that: it emits `ActionInvoked` for
+/// the owning application and closes the notification.
 async fn forward_activated_notifications(
     connection: Connection,
     runtime: Arc<dyn MistApp>,
@@ -483,28 +486,16 @@ async fn forward_activated_notifications(
         };
         origins.lock().await.remove(&desktop_id);
         if let Err(error) = connection
-            .emit_signal(
-                None::<&str>,
+            .call_method(
+                Some(RSYNAPSE_NOTIFICATIONS_BUS_NAME),
                 "/org/freedesktop/Notifications",
-                "org.freedesktop.Notifications",
-                "ActionInvoked",
+                Some(RSYNAPSE_NOTIFICATIONS_INTERFACE),
+                "InvokeAction",
                 &(desktop_id, activation.action_id.as_str()),
             )
             .await
         {
-            eprintln!("mistd: could not re-emit ActionInvoked: {error}");
-        }
-        if let Err(error) = connection
-            .call_method(
-                Some("org.freedesktop.Notifications"),
-                "/org/freedesktop/Notifications",
-                Some("org.freedesktop.Notifications"),
-                "CloseNotification",
-                &(desktop_id,),
-            )
-            .await
-        {
-            eprintln!("mistd: could not close activated notification: {error}");
+            eprintln!("mistd: could not deliver notification action: {error}");
         }
     }
 }

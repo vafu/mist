@@ -270,11 +270,11 @@ public class MistRuntimeService : Service() {
                         Log.e(TAG, "could not activate notification action", it)
                         return@launch
                     }
+                    // Activation implies consumption: the owning device runs the
+                    // action and clears its own copy. Sending a separate consume
+                    // here would race with it and could drop the action.
                     runCatching { channel.activate(endpoint, notificationId, actionId) }
                         .onFailure { Log.e(TAG, "could not activate notification action", it) }
-                    // Activating an action consumes the notification.
-                    runCatching { channel.consume(endpoint, notificationId) }
-                        .onFailure { Log.w(TAG, "could not report consumed action", it) }
                     getSystemService(NotificationManager::class.java)
                         .cancel(notificationTagFor(notificationId), REMOTE_NOTIFICATION_ID)
                 }
