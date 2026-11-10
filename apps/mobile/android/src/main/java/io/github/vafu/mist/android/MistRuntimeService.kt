@@ -2,6 +2,7 @@ package io.github.vafu.mist.android
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -13,11 +14,13 @@ import android.os.IBinder
 import android.os.RemoteCallbackList
 import android.provider.MediaStore
 import android.util.Log
+import io.github.vafu.mist.android.R
 import io.github.vafu.mist.core.ClipboardContent
 import io.github.vafu.mist.core.Clipboard
 import io.github.vafu.mist.core.DeviceClass
 import io.github.vafu.mist.core.DeviceInfo
 import io.github.vafu.mist.core.DeviceManager
+import io.github.vafu.mist.core.DeviceStatus
 import io.github.vafu.mist.core.FileTransfer
 import io.github.vafu.mist.core.Media
 import io.github.vafu.mist.core.MediaCommandHandler
@@ -47,6 +50,12 @@ public class MistRuntimeService : Service() {
 
     @Volatile
     private var currentSnapshot: Bundle = stateBundle()
+
+    @Volatile
+    private var managedDevices: List<io.github.vafu.mist.core.ManagedDevice> = emptyList()
+
+    @Volatile
+    private var foregroundStarted: Boolean = false
     private var app: MistApp? = null
     private var devices: DeviceManager? = null
     private var pairing: Pairing? = null
@@ -191,6 +200,7 @@ public class MistRuntimeService : Service() {
         super.onCreate()
         createNotificationChannels()
         startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification())
+        foregroundStarted = true
         scope.launch { startRuntime() }
     }
 
@@ -202,6 +212,7 @@ public class MistRuntimeService : Service() {
             return START_NOT_STICKY
         }
         startForeground(FOREGROUND_NOTIFICATION_ID, foregroundNotification())
+        foregroundStarted = true
         intent?.let(MistServiceStarter::sharePayload)?.let { payload ->
             val asFile = intent.let(MistServiceStarter::shareAsFile)
             scope.launch { sendShare(payload, asFile) }
@@ -387,7 +398,7 @@ public class MistRuntimeService : Service() {
                     REMOTE_CHANNEL_ID
                 }
                 val builder = android.app.Notification.Builder(this, channelId)
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
+                    .setSmallIcon(R.drawable.ic_stat_mist)
                     .setContentTitle(received.notification.title)
                     .setContentText(received.notification.body)
                     .setSubText(
@@ -678,8 +689,11 @@ public class MistRuntimeService : Service() {
     private fun publishSnapshot() {
         val runtime = app ?: return
         val manager = devices ?: return
-        currentSnapshot = stateBundle(runtime.endpointId(), manager.list())
+        val managed = manager.list()
+        managedDevices = managed
+        currentSnapshot = stateBundle(runtime.endpointId(), managed)
         notifyCallbacks()
+        refreshForegroundNotification()
     }
 
     @Synchronized
@@ -748,13 +762,60 @@ public class MistRuntimeService : Service() {
         )
     }
 
-    private fun foregroundNotification(): android.app.Notification =
-        android.app.Notification.Builder(this, SERVICE_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("Mist is running")
-            .setContentText("Keeping your paired devices connected")
+    private fun foregroundNotification(): android.app.Notification {
+        val devices = managedDevices
+        val connected = devices.filter { it.status == DeviceStatus.CONNECTED }
+        val connecting = devices.filter { it.status == DeviceStatus.CONNECTING }
+
+        val title = when {
+            connected.isNotEmpty() -> "Connected"
+            connecting.isNotEmpty() -> "Connecting…"
+            else -> "Not connected"
+        }
+        val destinations = (connected.ifEmpty { connecting })
+            .joinToString(" · ") { it.device.displayName }
+
+        val builder = android.app.Notification.Builder(this, SERVICE_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_mist)
+            .setContentTitle(title)
+            .setContentIntent(openAppIntent())
             .setOngoing(true)
-            .build()
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+        if (destinations.isNotEmpty()) {
+            builder
+                .setContentText(destinations)
+                .setStyle(android.app.Notification.BigTextStyle().bigText(destinations))
+        }
+        return builder.build()
+    }
+
+    /** Opens the main activity from the ongoing notification. */
+    private fun openAppIntent(): PendingIntent {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_MAIN
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        return PendingIntent.getActivity(
+            this,
+            0,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /**
+     * Reposts the ongoing notification so it reflects the current device state.
+     * Safe to call before the service is foreground: it is a no-op then.
+     */
+    private fun refreshForegroundNotification() {
+        if (!foregroundStarted) return
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                .notify(FOREGROUND_NOTIFICATION_ID, foregroundNotification())
+        }.onFailure { Log.w(TAG, "Could not update the service notification", it) }
+    }
 
     private fun closeRuntimeHandles() {
         mediaSession?.release()
