@@ -407,9 +407,40 @@ type PendingNotify = Arc<Mutex<HashMap<u32, (String, String, Vec<String>)>>>;
 /// How many desktop notifications keep their action mapping.
 const MAX_TRACKED_DESKTOP_NOTIFICATIONS: usize = 256;
 
-/// Rsynapse notification server interface used to deliver actions home.
-const RSYNAPSE_NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
-const RSYNAPSE_NOTIFICATIONS_INTERFACE: &str = "org.rsynapse.Notifications1";
+/// The standard desktop notification bus name.
+const NOTIFICATIONS_BUS_NAME: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
+
+/// Vendor interface that can invoke an action on a notification it is showing.
+///
+/// The freedesktop notification spec delivers `ActionInvoked` from the server
+/// to the posting application, but has no method for a client to trigger an
+/// action. Delivering a tap that happened on another device therefore needs a
+/// server-side hook. Rsynapse provides one; servers that do not expose it still
+/// receive and show notifications, and only remote action taps are unavailable.
+const NOTIFICATION_INVOKE_INTERFACE: &str = "org.rsynapse.Notifications1";
+
+/// Whether the notification server exposes an action-invoking method.
+///
+/// Probed by introspection so mistd degrades instead of failing when paired
+/// with a server that only implements the freedesktop spec.
+async fn notification_server_can_invoke(connection: &Connection) -> bool {
+    let Ok(reply) = connection
+        .call_method(
+            Some(NOTIFICATIONS_BUS_NAME),
+            NOTIFICATIONS_OBJECT_PATH,
+            Some("org.freedesktop.DBus.Introspectable"),
+            "Introspect",
+            &(),
+        )
+        .await
+    else {
+        return false;
+    };
+    reply.body().deserialize::<String>().is_ok_and(|xml| {
+        xml.contains(NOTIFICATION_INVOKE_INTERFACE) && xml.contains("InvokeAction")
+    })
+}
 
 async fn forward_incoming_notifications(
     connection: Connection,
@@ -464,14 +495,21 @@ async fn forward_incoming_notifications(
 /// Delivers actions activated on a remote copy of a locally shown notification.
 ///
 /// `ActionInvoked` is only accepted from the notification server's own
-/// connection, so the server has to run the action on our behalf. The
-/// rsynapse-only `InvokeAction` method does that: it emits `ActionInvoked` for
-/// the owning application and closes the notification.
+/// connection, so the server has to run the action on our behalf through its
+/// invoke hook. When the server has no such hook (it only implements the
+/// freedesktop spec) the notification is closed instead: the tap does not reach
+/// the application, but nothing is left stuck on screen.
 async fn forward_activated_notifications(
     connection: Connection,
     runtime: Arc<dyn MistApp>,
     origins: ActionOrigins,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if !notification_server_can_invoke(&connection).await {
+        eprintln!(
+            "mistd: notification server lacks {NOTIFICATION_INVOKE_INTERFACE}.InvokeAction; \
+             remote action taps will close notifications without reaching the application"
+        );
+    }
     let activations = runtime.notification_channel().subscribe_activations();
     loop {
         let activation = activations.next().await?;
@@ -485,17 +523,28 @@ async fn forward_activated_notifications(
             continue;
         };
         origins.lock().await.remove(&desktop_id);
-        if let Err(error) = connection
+        let invoked = connection
             .call_method(
-                Some(RSYNAPSE_NOTIFICATIONS_BUS_NAME),
-                "/org/freedesktop/Notifications",
-                Some(RSYNAPSE_NOTIFICATIONS_INTERFACE),
+                Some(NOTIFICATIONS_BUS_NAME),
+                NOTIFICATIONS_OBJECT_PATH,
+                Some(NOTIFICATION_INVOKE_INTERFACE),
                 "InvokeAction",
                 &(desktop_id, activation.action_id.as_str()),
             )
-            .await
-        {
-            eprintln!("mistd: could not deliver notification action: {error}");
+            .await;
+        if let Err(error) = invoked {
+            eprintln!("mistd: could not invoke notification action: {error}");
+            // Fall back to closing, so a tap on an unsupported server at least
+            // clears the notification.
+            let _ = connection
+                .call_method(
+                    Some(NOTIFICATIONS_BUS_NAME),
+                    NOTIFICATIONS_OBJECT_PATH,
+                    Some(NOTIFICATIONS_BUS_NAME),
+                    "CloseNotification",
+                    &(desktop_id,),
+                )
+                .await;
         }
     }
 }
