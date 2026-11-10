@@ -21,6 +21,25 @@
     <method name="PushNotification">
       <arg name="title" type="s" direction="in"/>
       <arg name="body" type="s" direction="in"/>
+      <arg name="image_path" type="s" direction="in"/>
+      <arg name="targets" type="as" direction="in"/>
+    </method>
+    <method name="PushClipboardText">
+      <arg name="text" type="s" direction="in"/>
+      <arg name="targets" type="as" direction="in"/>
+    </method>
+    <method name="PushClipboardBlob">
+      <arg name="path" type="s" direction="in"/>
+      <arg name="mime_type" type="s" direction="in"/>
+      <arg name="targets" type="as" direction="in"/>
+    </method>
+    <method name="ShareFile">
+      <arg name="path" type="s" direction="in"/>
+      <arg name="targets" type="as" direction="in"/>
+    </method>
+    <method name="MediaCommand">
+      <arg name="player_id" type="s" direction="in"/>
+      <arg name="command" type="s" direction="in"/>
     </method>
     <method name="Shutdown"/>
 
@@ -29,6 +48,7 @@
     </property>
     <property name="Devices" type="a(ssssssb)" access="read"/>
     <property name="Connected" type="b" access="read"/>
+    <property name="MediaPlayers" type="a(sssssssss)" access="read"/>
 
     <signal name="DeviceChanged">
       <arg name="endpoint_id" type="s"/>
@@ -41,6 +61,12 @@
     </signal>
     <signal name="PairingFailed">
       <arg name="reason" type="s"/>
+    </signal>
+    <signal name="ClipboardReceived">
+      <arg name="endpoint_id" type="s"/>
+      <arg name="mime_type" type="s"/>
+      <arg name="text" type="s"/>
+      <arg name="path" type="s"/>
     </signal>
   </interface>
 </node>
