@@ -450,20 +450,30 @@ async fn forward_incoming_notifications(
     let notifications = runtime.notification_channel().subscribe();
     loop {
         let received = notifications.next().await?;
+        // A notification may be updated by re-posting it with the same id.
+        // Reuse the desktop id the server already assigned so the update
+        // replaces the existing popup instead of stacking a new one.
+        let existing_desktop_id = {
+            let origins = origins.lock().await;
+            desktop_id_for_source(
+                &origins,
+                &received.source_endpoint_id,
+                &received.notification.id,
+            )
+        };
         let desktop_id = show_desktop_notification(
             &connection,
             &received.source_device.display_name,
             &received.notification,
+            existing_desktop_id,
         )
         .await?;
         // Every incoming notification is tracked so that dismissing it locally
         // can be reported back, not only the ones with action buttons.
         {
             let mut origins = origins.lock().await;
-            if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
-                origins.clear();
-            }
-            origins.insert(
+            track_desktop_origin(
+                &mut origins,
                 desktop_id,
                 (
                     received.source_endpoint_id.clone(),
@@ -490,6 +500,47 @@ async fn forward_incoming_notifications(
             )
             .await?;
     }
+}
+
+/// Finds the desktop notification showing a source notification.
+fn desktop_id_for_source(
+    origins: &HashMap<u32, (String, String, Vec<String>)>,
+    endpoint_id: &str,
+    notification_id: &str,
+) -> Option<u32> {
+    origins.iter().find_map(|(desktop_id, origin)| {
+        (origin.0 == endpoint_id && origin.1 == notification_id).then_some(*desktop_id)
+    })
+}
+
+/// Records the desktop id for a source notification, replacing any previous
+/// desktop id for the same source notification.
+fn track_desktop_origin(
+    origins: &mut HashMap<u32, (String, String, Vec<String>)>,
+    desktop_id: u32,
+    origin: (String, String, Vec<String>),
+) {
+    origins.retain(|existing_desktop_id, existing| {
+        *existing_desktop_id == desktop_id || existing.0 != origin.0 || existing.1 != origin.1
+    });
+    if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
+        origins.clear();
+    }
+    origins.insert(desktop_id, origin);
+}
+
+/// Resolves the source notification id for a desktop `Notify` that replaces
+/// an existing notification.
+fn source_id_for_replacement(
+    origins: &HashMap<u32, (String, String, Vec<String>)>,
+    replaces_id: u32,
+) -> Option<String> {
+    if replaces_id == 0 {
+        return None;
+    }
+    origins
+        .get(&replaces_id)
+        .map(|(_, notification_id, _)| notification_id.clone())
 }
 
 /// Delivers actions activated on a remote copy of a locally shown notification.
@@ -803,6 +854,7 @@ async fn show_desktop_notification(
     connection: &Connection,
     device_name: &str,
     notification: &Notification,
+    replaces_id: Option<u32>,
 ) -> zbus::Result<u32> {
     let mut actions: Vec<&str> = Vec::with_capacity(notification.actions.len() * 2);
     for action in &notification.actions {
@@ -827,7 +879,7 @@ async fn show_desktop_notification(
             hints.insert("image-path", value);
         }
     }
-    let replaces_id = 0_u32;
+    let replaces_id = replaces_id.unwrap_or(0);
     connection
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -915,10 +967,7 @@ async fn monitor_desktop_notifications(
                 let origin = pending_notify.lock().await.remove(&reply_to.get());
                 if let (Some(desktop_id), Some(origin)) = (assigned, origin) {
                     let mut origins = action_origins.lock().await;
-                    if origins.len() >= MAX_TRACKED_DESKTOP_NOTIFICATIONS {
-                        origins.clear();
-                    }
-                    origins.insert(desktop_id, origin);
+                    track_desktop_origin(&mut origins, desktop_id, origin);
                 }
             }
             continue;
@@ -946,7 +995,7 @@ async fn monitor_desktop_notifications(
             handle_notification_closed(&runtime, &action_origins, &message).await;
             continue;
         }
-        forward_desktop_notification(&message, &runtime, &pending_notify).await;
+        forward_desktop_notification(&message, &runtime, &action_origins, &pending_notify).await;
     }
     Ok(())
 }
@@ -959,12 +1008,20 @@ async fn monitor_desktop_notifications(
 async fn forward_desktop_notification(
     message: &zbus::Message,
     runtime: &Arc<dyn MistApp>,
+    action_origins: &ActionOrigins,
     pending_notify: &PendingNotify,
 ) {
-    let Ok((application, _, app_icon, title, body, raw_actions, hints, _)) =
+    let Ok((application, replaces_id, app_icon, title, body, raw_actions, hints, _)) =
         message.body().deserialize::<NotifyBody>()
     else {
         return;
+    };
+    // The desktop server signals an update through the `replaces_id` argument.
+    // Reuse the id we assigned to the original call so paired devices treat it
+    // as an update too, rather than as a new notification.
+    let existing_id = {
+        let origins = action_origins.lock().await;
+        source_id_for_replacement(&origins, replaces_id)
     };
     let icon = hint_image(&hints, "image-path")
         .or_else(|| hint_image(&hints, "image_path"))
@@ -973,7 +1030,9 @@ async fn forward_desktop_notification(
         .or_else(|| desktop_entry_icon(&hints));
     let image = hint_image(&hints, "image-data").or_else(|| hint_image(&hints, "image_data"));
     let notification = Notification {
-        id: format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed)),
+        id: existing_id.unwrap_or_else(|| {
+            format!("linux:{}", NOTIFICATION_ID.fetch_add(1, Ordering::Relaxed))
+        }),
         application,
         title,
         body,
@@ -1153,4 +1212,55 @@ fn unix_millis() -> i64 {
 
 fn fdo_error(error: impl std::fmt::Display) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn origin(notification_id: &str) -> (String, String, Vec<String>) {
+        ("peer".to_owned(), notification_id.to_owned(), Vec::new())
+    }
+
+    #[test]
+    fn finds_desktop_id_for_a_source_notification() {
+        let origins = HashMap::from([(7, origin("phone:1"))]);
+
+        assert_eq!(desktop_id_for_source(&origins, "peer", "phone:1"), Some(7));
+        assert_eq!(desktop_id_for_source(&origins, "other", "phone:1"), None);
+        assert_eq!(desktop_id_for_source(&origins, "peer", "phone:2"), None);
+    }
+
+    #[test]
+    fn replacement_resolves_the_original_source_notification() {
+        let origins = HashMap::from([(7, origin("phone:1"))]);
+
+        assert_eq!(
+            source_id_for_replacement(&origins, 7).as_deref(),
+            Some("phone:1")
+        );
+        assert_eq!(source_id_for_replacement(&origins, 0), None);
+        assert_eq!(source_id_for_replacement(&origins, 8), None);
+    }
+
+    #[test]
+    fn tracking_a_replacement_keeps_only_the_new_desktop_id() {
+        let mut origins = HashMap::from([(7, origin("phone:1"))]);
+
+        track_desktop_origin(&mut origins, 9, origin("phone:1"));
+
+        assert_eq!(origins.len(), 1);
+        assert_eq!(desktop_id_for_source(&origins, "peer", "phone:1"), Some(9));
+    }
+
+    #[test]
+    fn tracking_keeps_distinct_source_notifications() {
+        let mut origins = HashMap::from([(7, origin("phone:1"))]);
+
+        track_desktop_origin(&mut origins, 9, origin("phone:2"));
+
+        assert_eq!(origins.len(), 2);
+        assert_eq!(desktop_id_for_source(&origins, "peer", "phone:1"), Some(7));
+        assert_eq!(desktop_id_for_source(&origins, "peer", "phone:2"), Some(9));
+    }
 }
