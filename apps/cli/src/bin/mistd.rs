@@ -461,13 +461,23 @@ async fn forward_incoming_notifications(
                 &received.notification.id,
             )
         };
-        let desktop_id = show_desktop_notification(
+        let desktop_id = match show_desktop_notification(
             &connection,
             &received.source_device.display_name,
             &received.notification,
             existing_desktop_id,
         )
-        .await?;
+        .await
+        {
+            Ok(desktop_id) => desktop_id,
+            Err(error) => {
+                eprintln!(
+                    "mistd: could not show notification {} from {}: {error}",
+                    received.notification.id, received.source_endpoint_id
+                );
+                continue;
+            }
+        };
         // Every incoming notification is tracked so that dismissing it locally
         // can be reported back, not only the ones with action buttons.
         {
